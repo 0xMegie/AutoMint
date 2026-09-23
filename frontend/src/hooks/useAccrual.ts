@@ -1,19 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  registerUser,
-  mintBasicBot,
-  startAccrual,
   getAccrualState,
   getUserProfile,
   isRegistered,
   getUserBots,
   getAmtBalance,
-  claimPoints,
 } from "@/lib/contracts";
+import { executeTransaction, type TransactionStatus } from "@/lib/transaction";
 import { getLedgerCloseTime } from "@/lib/stellar";
 import { useWalletStore, selectPublicKey } from "@/store/walletStore";
 import { useState, useEffect, useRef } from "react";
+import { nativeToScVal } from "@stellar/stellar-sdk";
 import type { AccrualState, UserProfile } from "@/types";
 import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
@@ -29,26 +27,107 @@ export function useRegister() {
     mutationFn: async (username: string) => {
       if (!publicKey) throw new Error("Wallet not connected");
 
+      const REGISTRY_CONTRACT_ID = process.env.NEXT_PUBLIC_REGISTRY_CONTRACT_ID || "";
+      const BOT_NFT_CONTRACT_ID = process.env.NEXT_PUBLIC_BOT_NFT_CONTRACT_ID || "";
+      const ACCRUAL_CONTRACT_ID = process.env.NEXT_PUBLIC_ACCRUAL_CONTRACT_ID || "";
+
+      // Helper to execute a transaction and handle toast updates
+      const executeStep = async (
+        label: string,
+        contractId: string,
+        method: string,
+        args: any[]
+      ) => {
+        return new Promise((resolve, reject) => {
+          executeTransaction({
+            contractId,
+            method,
+            args,
+            sourceAddress: publicKey,
+            onStatus: (status: TransactionStatus) => {
+              switch (status.stage) {
+                case "building":
+                  toast.loading(`${label}: Building transaction...`, { id: label });
+                  break;
+                case "simulating":
+                  toast.loading(`${label}: Simulating...`, { id: label });
+                  break;
+                case "signing":
+                  toast.loading(`${label}: Waiting for wallet signature...`, {
+                    id: label,
+                  });
+                  break;
+                case "submitting":
+                  toast.loading(`${label}: Submitting to blockchain...`, {
+                    id: label,
+                  });
+                  break;
+                case "polling":
+                  toast.loading(`${label}: Confirming on-chain... (${status.hash?.slice(0, 8)})`, {
+                    id: label,
+                  });
+                  break;
+                case "success":
+                  toast.success(
+                    `${label}: Complete!
+                     ${status.explorerUrl ? `View on explorer` : ""}`.trim(),
+                    {
+                      id: label,
+                      action: status.explorerUrl
+                        ? {
+                            label: "View",
+                            onClick: () => window.open(status.explorerUrl, "_blank"),
+                          }
+                        : undefined,
+                    }
+                  );
+                  resolve(status);
+                  break;
+                case "error":
+                  toast.error(`${label}: ${status.error || "Unknown error"}`, {
+                    id: label,
+                  });
+                  reject(new Error(`${label} failed: ${status.error}`));
+                  break;
+              }
+            },
+          }).catch(reject);
+        });
+      };
+
       // Step 1: Register user
-      toast.loading("Registering user...", { id: "register" });
-      const registerTx = await registerUser(publicKey, username);
-      toast.success("User registered successfully!", { id: "register" });
+      await executeStep(
+        "Registering user",
+        REGISTRY_CONTRACT_ID,
+        "register",
+        [
+          nativeToScVal(publicKey, { type: "address" }),
+          nativeToScVal(username, { type: "string" }),
+        ]
+      );
 
       // Step 2: Mint basic bot
-      toast.loading("Minting basic bot...", { id: "mint" });
-      const mintTx = await mintBasicBot(publicKey);
-      toast.success("Basic bot minted successfully!", { id: "mint" });
+      await executeStep(
+        "Minting basic bot",
+        BOT_NFT_CONTRACT_ID,
+        "mint_basic",
+        [nativeToScVal(publicKey, { type: "address" })]
+      );
 
       // Step 3: Start accrual
-      toast.loading("Starting accrual...", { id: "accrual" });
-      const accrualTx = await startAccrual(publicKey, BASIC_BOT_RATE);
-      toast.success("Accrual started successfully!", { id: "accrual" });
+      await executeStep(
+        "Starting accrual",
+        ACCRUAL_CONTRACT_ID,
+        "start_accrual",
+        [
+          nativeToScVal(publicKey, { type: "address" }),
+          nativeToScVal(BASIC_BOT_RATE, { type: "u32" }),
+        ]
+      );
 
-      return { registerTx, mintTx, accrualTx };
+      return { success: true };
     },
     onSuccess: () => {
-      toast.success("Registration complete! Welcome to AutoMint!");
-
       // Delayed refetch to allow blockchain state to propagate
       setTimeout(() => {
         queryClient.invalidateQueries({ queryKey: qk.registered(publicKey) });
@@ -60,10 +139,8 @@ export function useRegister() {
       }, 2000);
     },
     onError: (error: Error) => {
-      toast.dismiss("register");
-      toast.dismiss("mint");
-      toast.dismiss("accrual");
-      toast.error(error.message || "Registration failed");
+      // onStatus callbacks already handle error toasts
+      console.error("Registration failed:", error);
     },
   });
 }
@@ -202,10 +279,64 @@ export function useClaim() {
   return useMutation({
     mutationFn: async () => {
       if (!publicKey) throw new Error("Wallet not connected");
-      return claimPoints(publicKey);
+
+      const ACCRUAL_CONTRACT_ID = process.env.NEXT_PUBLIC_ACCRUAL_CONTRACT_ID || "";
+      const TOKEN_CONTRACT_ID = process.env.NEXT_PUBLIC_TOKEN_CONTRACT_ID || "";
+      const REGISTRY_CONTRACT_ID = process.env.NEXT_PUBLIC_REGISTRY_CONTRACT_ID || "";
+
+      return new Promise((resolve, reject) => {
+        executeTransaction({
+          contractId: ACCRUAL_CONTRACT_ID,
+          method: "claim",
+          args: [
+            nativeToScVal(publicKey, { type: "address" }),
+            nativeToScVal(TOKEN_CONTRACT_ID, { type: "address" }),
+            nativeToScVal(REGISTRY_CONTRACT_ID, { type: "address" }),
+          ],
+          sourceAddress: publicKey,
+          onStatus: (status: TransactionStatus) => {
+            switch (status.stage) {
+              case "building":
+              case "simulating":
+              case "assembling":
+                toast.loading("Preparing claim transaction...", { id: "claim" });
+                break;
+              case "signing":
+                toast.loading("Waiting for wallet signature...", { id: "claim" });
+                break;
+              case "submitting":
+                toast.loading("Submitting claim to blockchain...", { id: "claim" });
+                break;
+              case "polling":
+                toast.loading(
+                  `Confirming on-chain... (${status.hash?.slice(0, 8)})`,
+                  { id: "claim" }
+                );
+                break;
+              case "success":
+                toast.success("Points claimed successfully!", {
+                  id: "claim",
+                  action: status.explorerUrl
+                    ? {
+                        label: "View",
+                        onClick: () => window.open(status.explorerUrl, "_blank"),
+                      }
+                    : undefined,
+                });
+                resolve(status);
+                break;
+              case "error":
+                toast.error(`Claim failed: ${status.error || "Unknown error"}`, {
+                  id: "claim",
+                });
+                reject(new Error(status.error || "Claim failed"));
+                break;
+            }
+          },
+        }).catch(reject);
+      });
     },
     onSuccess: () => {
-      toast.success("Points claimed successfully!");
       queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.amtBalance(publicKey) });
@@ -213,7 +344,8 @@ export function useClaim() {
       queryClient.invalidateQueries({ queryKey: qk.dashboard(publicKey) });
     },
     onError: (error: Error) => {
-      toast.error(error.message || "Failed to claim points");
+      // onStatus callback already handles error toasts
+      console.error("Claim failed:", error);
     },
   });
 }

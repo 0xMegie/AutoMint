@@ -249,37 +249,18 @@ export async function executeTransaction({
       .setTimeout(TX_TIMEOUT)
       .build();
 
-    // 2. Simulate to get resource fees and footprint
-    onStatus({ stage: "simulating" });
-    const simResult = await withRetry(() => server.simulateTransaction(tx));
-
-    if (SorobanRpc.Api.isSimulationError(simResult)) {
-      throw new Error(`Simulation failed: ${simResult.error}`);
-    }
-
-    if (!simResult.transactionData) {
-      throw new Error("Simulation did not return transaction data");
-    }
-
-    // 3. Prepare (assemble) the final transaction with resource fees
+    // 2. Prepare (assemble) the final transaction with resource fees
     onStatus({ stage: "assembling" });
-    const prepared = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
-    })
-      .addOperation(contract.call(method, ...args))
-      .setTimeout(TX_TIMEOUT)
-      .build();
-
-    // Apply simulation results to transaction
-    const assembledTx = SorobanRpc.Api.assembleTransaction(prepared, simResult).build();
+    const prepared = await withRetry(() => server.prepareTransaction(tx));
 
     // Apply fee multiplier after assembly
     if (FEE_MULTIPLIER !== 1.0) {
-      const baseFeeNum = parseInt(assembledTx.fee, 10);
+      const baseFeeNum = parseInt(prepared.fee, 10);
       const multipliedFee = Math.ceil(baseFeeNum * FEE_MULTIPLIER).toString();
-      assembledTx.fee = multipliedFee;
+      prepared.fee = multipliedFee;
     }
+
+    const assembledTx = prepared;
 
     // 4. Request wallet signature
     onStatus({ stage: "signing" });
@@ -402,9 +383,19 @@ async function pollTransaction(
       const result = await server.getTransaction(txHash);
 
       if (result.status === "SUCCESS") {
+        // Decode return value if present (it's an XDR ScVal)
+        let returnValue: unknown = undefined;
+        if (result.returnValue) {
+          try {
+            returnValue = scValToNative(result.returnValue);
+          } catch {
+            // If decoding fails, keep it as undefined
+          }
+        }
+
         return {
           status: "SUCCESS",
-          returnValue: result.returnValue,
+          returnValue,
           sequenceNumber: result.sequenceNumber
             ? parseInt(result.sequenceNumber, 10)
             : undefined,
