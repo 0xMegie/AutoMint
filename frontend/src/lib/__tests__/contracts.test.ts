@@ -1,8 +1,17 @@
 /**
- * Tests for the registry contract calls in contracts.ts (#130).
+ * Tests for the read functions in contracts.ts (#459, #460, AM-143).
  *
- * The stellar.ts helper module is mocked so these tests exercise only the
- * argument-building / result-decoding logic in contracts.ts.
+ * Verifies three properties for every read function:
+ *   1. RPC failures throw — they are never swallowed or returned as empty data.
+ *   2. Specific contract error codes (NotRegistered / NotFound) return null
+ *      where the contract semantics warrant it, not all errors.
+ *   3. Normal data round-trips correctly.
+ *
+ * Also tests the defaultSource() priority chain (#459):
+ *   explicit arg > connected wallet (Zustand) > env-var fallback > throw
+ *
+ * The stellar.ts helper is mocked so tests exercise only the
+ * argument-building / result-decoding / error-handling logic in contracts.ts.
  */
 
 jest.mock("@stellar/stellar-sdk", () => {
@@ -20,12 +29,30 @@ jest.mock("../stellar", () => ({
   simulateContractCall: jest.fn(),
 }));
 
+// Wallet store mock: expose a controllable getState() snapshot so we can
+// simulate connected / disconnected states without a React tree.
+const mockWalletGetState = jest.fn<{ publicKey: string | null }, []>();
+jest.mock("@/store/walletStore", () => ({
+  useWalletStore: {
+    getState: () => mockWalletGetState(),
+  },
+}));
+
+// Constants mock: lets individual tests override ANONYMOUS_READ_SOURCE.
+jest.mock("../constants", () => ({
+  ...jest.requireActual("../constants"),
+  ANONYMOUS_READ_SOURCE: "",
+}));
+
 import { simulateContractCall } from "../stellar";
 import {
   isRegistered,
   getTotalUsers,
   getUserProfile,
+  getAccrualState,
   getLeaderboard,
+  getActiveListings,
+  getUserListings,
   getUserRank,
   UNRANKED_SENTINEL,
 } from "../contracts";
@@ -34,8 +61,85 @@ const mockSimulate = simulateContractCall as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // Default: wallet disconnected, no env-var fallback.
+  mockWalletGetState.mockReturnValue({ publicKey: null });
 });
 
+// ---------------------------------------------------------------------------
+// defaultSource() priority chain (#459)
+//
+// defaultSource is private so we exercise it through the public functions
+// that call it (getLeaderboard and getTotalUsers accept an optional
+// sourceAddress parameter).
+// ---------------------------------------------------------------------------
+describe("defaultSource", () => {
+  it("uses an explicit sourceAddress when provided", async () => {
+    mockSimulate.mockResolvedValue([]);
+    await getLeaderboard(10, "GEXPLICIT");
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_leaderboard",
+      expect.any(Array),
+      "GEXPLICIT"  // explicit arg wins
+    );
+  });
+
+  it("falls back to the connected wallet when no explicit arg is given", async () => {
+    mockWalletGetState.mockReturnValue({ publicKey: "GWALLET" });
+    mockSimulate.mockResolvedValue([]);
+    await getLeaderboard(10);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_leaderboard",
+      expect.any(Array),
+      "GWALLET"  // Zustand store snapshot used
+    );
+  });
+
+  it("falls back to ANONYMOUS_READ_SOURCE when wallet is disconnected", async () => {
+    // Override the constants mock for this test only.
+    const constants = jest.requireMock("../constants") as Record<string, unknown>;
+    const original = constants.ANONYMOUS_READ_SOURCE;
+    constants.ANONYMOUS_READ_SOURCE = "GENV_FALLBACK";
+    try {
+      mockWalletGetState.mockReturnValue({ publicKey: null });
+      mockSimulate.mockResolvedValue([]);
+      await getLeaderboard(10);
+      expect(mockSimulate).toHaveBeenCalledWith(
+        expect.any(String),
+        "get_leaderboard",
+        expect.any(Array),
+        "GENV_FALLBACK"  // env-var fallback used
+      );
+    } finally {
+      constants.ANONYMOUS_READ_SOURCE = original;
+    }
+  });
+
+  it("throws a descriptive error when no source is available at all", async () => {
+    mockWalletGetState.mockReturnValue({ publicKey: null });
+    // ANONYMOUS_READ_SOURCE is "" (default in the mock above)
+    await expect(getLeaderboard(10)).rejects.toThrow(
+      "NEXT_PUBLIC_SIMULATION_SOURCE"
+    );
+  });
+
+  it("explicit arg takes precedence over a connected wallet", async () => {
+    mockWalletGetState.mockReturnValue({ publicKey: "GWALLET" });
+    mockSimulate.mockResolvedValue(0);
+    await getTotalUsers("GOVERRIDE");
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "total_users",
+      [],
+      "GOVERRIDE"  // explicit arg beats wallet
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isRegistered
+// ---------------------------------------------------------------------------
 describe("isRegistered", () => {
   it("returns true when the registry reports the user as registered", async () => {
     mockSimulate.mockResolvedValue(true);
@@ -48,12 +152,20 @@ describe("isRegistered", () => {
     );
   });
 
-  it("throws when the simulation throws (AM-143)", async () => {
+  it("returns false when the registry reports the user as not registered", async () => {
+    mockSimulate.mockResolvedValue(false);
+    await expect(isRegistered("GUSER")).resolves.toBe(false);
+  });
+
+  it("throws on RPC failure — never returns false for a network error (AM-143)", async () => {
     mockSimulate.mockRejectedValue(new Error("rpc down"));
     await expect(isRegistered("GUSER")).rejects.toThrow("rpc down");
   });
 });
 
+// ---------------------------------------------------------------------------
+// getTotalUsers
+// ---------------------------------------------------------------------------
 describe("getTotalUsers", () => {
   it("returns the numeric total on success", async () => {
     mockSimulate.mockResolvedValue(7);
@@ -70,8 +182,21 @@ describe("getTotalUsers", () => {
     mockSimulate.mockRejectedValue(new Error("rpc down"));
     await expect(getTotalUsers("GSRC")).rejects.toThrow("rpc down");
   });
+
+  it("throws when the contract returns null — not silently 0", async () => {
+    mockSimulate.mockResolvedValue(null);
+    await expect(getTotalUsers("GSRC")).rejects.toThrow("total_users returned no value");
+  });
+
+  it("throws when the contract returns undefined — not silently 0", async () => {
+    mockSimulate.mockResolvedValue(undefined);
+    await expect(getTotalUsers("GSRC")).rejects.toThrow("total_users returned no value");
+  });
 });
 
+// ---------------------------------------------------------------------------
+// getUserProfile
+// ---------------------------------------------------------------------------
 describe("getUserProfile", () => {
   it("parses the raw profile into a typed UserProfile", async () => {
     mockSimulate.mockResolvedValue({
@@ -83,12 +208,86 @@ describe("getUserProfile", () => {
     expect(profile).toEqual({ address: "GUSER", username: "Alice", points: 350n });
   });
 
-  it("throws when the simulation throws (AM-143)", async () => {
+  it("throws on generic RPC failure — not swallowed as null (AM-143)", async () => {
     mockSimulate.mockRejectedValue(new Error("rpc down"));
     await expect(getUserProfile("GUSER")).rejects.toThrow("rpc down");
   });
+
+  it("returns null on contract NotRegistered error code #1", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_user: Error(Contract, #1)")
+    );
+    await expect(getUserProfile("GSTRANGER")).resolves.toBeNull();
+  });
+
+  it("returns null on contract NotRegistered named error", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_user: NotRegistered")
+    );
+    await expect(getUserProfile("GSTRANGER")).resolves.toBeNull();
+  });
+
+  it("throws on a different contract error code — not swallowed as null", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_user: Error(Contract, #5)")
+    );
+    await expect(getUserProfile("GUSER")).rejects.toThrow("Error(Contract, #5)");
+  });
 });
 
+// ---------------------------------------------------------------------------
+// getAccrualState
+// ---------------------------------------------------------------------------
+describe("getAccrualState", () => {
+  it("parses raw accrual state correctly", async () => {
+    mockSimulate.mockResolvedValue({
+      last_claim_ts: 1_700_000_000n,
+      total_claimed_points: 42n,
+    });
+    const state = await getAccrualState("GUSER");
+    expect(state).toEqual({
+      last_claim_ts: 1_700_000_000n,
+      total_claimed_points: 42n,
+    });
+  });
+
+  it("throws on generic RPC failure — not swallowed as null (AM-143)", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getAccrualState("GUSER")).rejects.toThrow("rpc down");
+  });
+
+  it("returns null on contract NotFound error code #2", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_accrual_state: Error(Contract, #2)")
+    );
+    await expect(getAccrualState("GNEWUSER")).resolves.toBeNull();
+  });
+
+  it("returns null on contract NotFound named error", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_accrual_state: NotFound")
+    );
+    await expect(getAccrualState("GNEWUSER")).resolves.toBeNull();
+  });
+
+  it("returns null on contract NotRegistered error code #1", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_accrual_state: Error(Contract, #1)")
+    );
+    await expect(getAccrualState("GNEWUSER")).resolves.toBeNull();
+  });
+
+  it("throws on a different contract error code — not swallowed as null", async () => {
+    mockSimulate.mockRejectedValue(
+      new Error("Simulation failed for get_accrual_state: Error(Contract, #9)")
+    );
+    await expect(getAccrualState("GUSER")).rejects.toThrow("Error(Contract, #9)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getLeaderboard
+// ---------------------------------------------------------------------------
 describe("getLeaderboard", () => {
   it("maps an array of raw profiles", async () => {
     mockSimulate.mockResolvedValue([
@@ -102,14 +301,102 @@ describe("getLeaderboard", () => {
     ]);
   });
 
-  it("throws on error so React Query captures isError (AM-143)", async () => {
+  it("throws on RPC failure — not silently [] (AM-143)", async () => {
     mockSimulate.mockRejectedValue(new Error("boom"));
     await expect(getLeaderboard(10, "GSRC")).rejects.toThrow("boom");
+  });
+
+  it("throws when the contract returns a non-array — schema mismatch, not empty list", async () => {
+    mockSimulate.mockResolvedValue(null);
+    await expect(getLeaderboard(10, "GSRC")).rejects.toThrow(
+      "get_leaderboard returned unexpected type"
+    );
+  });
+
+  it("returns an empty array when the contract genuinely returns []", async () => {
+    mockSimulate.mockResolvedValue([]);
+    await expect(getLeaderboard(10, "GSRC")).resolves.toEqual([]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// #506 — resolving a single user's standing
+// getActiveListings
+// ---------------------------------------------------------------------------
+describe("getActiveListings", () => {
+  const rawListing = {
+    id: 1n,
+    seller: "GSELLER",
+    bot_id: 10n,
+    price: 500n,
+    listed_at: 1_700_000_000n,
+  };
+
+  it("maps an array of raw listings", async () => {
+    mockSimulate.mockResolvedValue([rawListing]);
+    const listings = await getActiveListings(0, 100, "GSRC");
+    expect(listings).toEqual([
+      { id: 1n, seller: "GSELLER", bot_id: 10n, price: 500n, listed_at: 1_700_000_000n },
+    ]);
+  });
+
+  it("throws on RPC failure — not silently [] (AM-143)", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getActiveListings(0, 100, "GSRC")).rejects.toThrow("rpc down");
+  });
+
+  it("throws when the contract returns a non-array — schema mismatch, not empty list", async () => {
+    mockSimulate.mockResolvedValue(undefined);
+    await expect(getActiveListings(0, 100, "GSRC")).rejects.toThrow(
+      "get_active_listings returned unexpected type"
+    );
+  });
+
+  it("returns an empty array when the contract genuinely returns []", async () => {
+    mockSimulate.mockResolvedValue([]);
+    await expect(getActiveListings(0, 100, "GSRC")).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getUserListings
+// ---------------------------------------------------------------------------
+describe("getUserListings", () => {
+  const rawListing = {
+    id: 2n,
+    seller: "GUSER",
+    bot_id: 20n,
+    price: 1000n,
+    listed_at: 1_700_000_001n,
+  };
+
+  it("maps an array of raw listings for the user", async () => {
+    mockSimulate.mockResolvedValue([rawListing]);
+    const listings = await getUserListings("GUSER");
+    expect(listings).toEqual([
+      { id: 2n, seller: "GUSER", bot_id: 20n, price: 1000n, listed_at: 1_700_000_001n },
+    ]);
+  });
+
+  it("throws on RPC failure — not silently [] (AM-143)", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getUserListings("GUSER")).rejects.toThrow("rpc down");
+  });
+
+  it("throws when the contract returns a non-array — schema mismatch, not empty list", async () => {
+    mockSimulate.mockResolvedValue("unexpected");
+    await expect(getUserListings("GUSER")).rejects.toThrow(
+      "get_user_listings returned unexpected type"
+    );
+  });
+
+  it("returns an empty array when the contract genuinely returns []", async () => {
+    mockSimulate.mockResolvedValue([]);
+    await expect(getUserListings("GUSER")).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getUserRank (pre-existing, kept for regression coverage)
 // ---------------------------------------------------------------------------
 describe("getUserRank", () => {
   const board = [

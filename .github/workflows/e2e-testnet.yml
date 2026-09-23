@@ -57,7 +57,7 @@ jobs:
         run: npm run test:e2e
         env:
           NEXT_PUBLIC_SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
-          NEXT_PUBLIC_READ_SOURCE_ACCOUNT: ${{ vars.TESTNET_READ_SOURCE_ACCOUNT }}
+          NEXT_PUBLIC_SIMULATION_SOURCE: ${{ vars.TESTNET_READ_SOURCE_ACCOUNT }}
           NEXT_PUBLIC_REGISTRY_CONTRACT_ID: ${{ github.event.inputs.testnet_contract_registry || vars.TESTNET_CONTRACT_REGISTRY_ID || '' }}
           NEXT_PUBLIC_BOT_NFT_CONTRACT_ID: ${{ github.event.inputs.testnet_contract_bot || vars.TESTNET_CONTRACT_BOT_ID || '' }}
           NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID: ${{ github.event.inputs.testnet_contract_marketplace || vars.TESTNET_CONTRACT_MARKETPLACE_ID || '' }}
