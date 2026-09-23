@@ -11,8 +11,16 @@ import {
   requestAccess as freighterRequestAccess,
   getNetwork as freighterGetNetwork,
 } from "@stellar/freighter-api";
-import { BASE_FEE, SOROBAN_RPC_URL, STELLAR_NETWORK_PASSPHRASE } from "./constants";
+import { BASE_FEE, SOROBAN_RPC_URL, STELLAR_NETWORK_PASSPHRASE, TX_TIMEOUT } from "./constants";
 import { withRetry } from "./rpcRetry";
+
+/**
+ * Multiplier applied to the assembled resource fee to add a safety buffer.
+ * Configurable via NEXT_PUBLIC_FEE_MULTIPLIER env var (default 1.0).
+ * Applied AFTER server.prepareTransaction assembles the resource fee,
+ * not before, to ensure the base fee covers the simulated cost.
+ */
+const FEE_MULTIPLIER = Number(process.env.NEXT_PUBLIC_FEE_MULTIPLIER) || 1.0;
 
 /**
  * Module-level singleton — created once, reused on every subsequent call.
@@ -143,7 +151,7 @@ export async function simulateContractCall(
     networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
   })
     .addOperation(contract.call(method, ...args))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const result = await withRetry(() => server.simulateTransaction(tx));
@@ -173,6 +181,10 @@ export async function simulateContractCall(
  * applies to every write across all 5 contracts (registry, bot_nft, accrual,
  * marketplace, token), including each leg of the register → mint_basic →
  * start_accrual flow.
+ *
+ * After assembly, the fee is multiplied by `FEE_MULTIPLIER` (configurable
+ * via `NEXT_PUBLIC_FEE_MULTIPLIER`, default 1.0) to add a safety buffer
+ * during network congestion.
  */
 export async function buildPreparedTx(
   contractId: string,
@@ -189,10 +201,18 @@ export async function buildPreparedTx(
     networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
   })
     .addOperation(contract.call(method, ...args))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const prepared = await withRetry(() => server.prepareTransaction(tx));
+
+  // Apply fee multiplier to assembled resource fee for surge buffer
+  if (FEE_MULTIPLIER !== 1.0) {
+    const baseFeeNum = parseInt(prepared.fee, 10);
+    const multipliedFee = Math.ceil(baseFeeNum * FEE_MULTIPLIER).toString();
+    prepared.fee = multipliedFee;
+  }
+
   return prepared.toXDR();
 }
 
