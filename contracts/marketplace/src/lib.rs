@@ -3,11 +3,60 @@
 #![no_std]
 //! Marketplace contract for trading NFT bots.
 //!
+//! ## Listing-ID enumeration — deliberate public design
+//!
+//! Listing IDs are sequential `u64` values beginning at `1` and incremented via
+//! `NextListingId` on every successful `list_bot`. The current value is
+//! readable through [`MarketplaceContract::next_listing_id`], so off-chain
+//! tooling can discover total volume without scanning.
+//!
+//! This enumeration is **intentionally public**. Historical `Listing` records
+//! remain readable via `get_listing(id)` even after the listing has been
+//! bought or cancelled (with `active == false`). `get_active_listings` only
+//! returns currently-active entries. Clients that need pagination should use
+//! `get_active_listings(start, limit)` together with `next_listing_id()` as a
+//! cursor bound rather than brute-force scanning all IDs. This design mirrors
+//! AM-016's cursor guidance and is a deliberate transparency choice for a
+//! public chain; an alternative (hash of `(seller, bot_id, nonce)`) was
+//! considered and rejected because it would hide volume at the cost of UX
+//! without adding privacy on-chain.
+//!
+//! ## Price, currency and fee relationship
+//!
+//! ```text
+//! fee = price * fee_bps / 10_000
+//! seller_receives = price - fee
+//! ```
+//! With a 7-decimal token (AMT) `price = 1` corresponds to `0.0000001` AMT. For
+//! `fee_bps = 250` (2.5 %) `fee = 1*250/10_000 = 0` — dust listings would be
+//! free to create and trade while generating no platform revenue. To prevent
+//! this, every allowed currency has a configurable `min_price`.
+//!
+//! `min_price(currency)` is the smallest `price` accepted by `list_bot` for
+//! that currency. If the admin has not set a custom value via
+//! `set_min_price`, the contract derives a **default** that guarantees the fee
+//! rounds to at least one base unit:
+//!
+//! ```text
+//! default_min_price = ceil(10_000 / fee_bps)   if fee_bps > 0
+//!                   = 1                        if fee_bps == 0
+//! ```
+//! For `fee_bps = 250`, `default_min_price = ceil(10_000/250) = 40`; any
+//! accepted price therefore satisfies `price * fee_bps / 10_000 >= 1`.
+//!
+//! Changing `fee_bps` via `set_fee_bps` automatically changes the *default* for
+//! currencies without an explicit override; currencies with an explicit
+//! `min_price` remain unchanged and must be updated by the admin if the new
+//! fee schedule requires a different floor. `set_min_price` exists for that
+//! purpose and is `admin`-only.
+//!
+//! `list_bot` returns `PriceTooLow` when `price < min_price(currency)`.
+//!
 //! ## Events
 //!
 //! The marketplace emits the following events for auditing:
 //! - `initialized`: Emitted when contract initializes.
-//!   Topics: ("initialized",), Data: (admin, bot_nft, fee_recipient)
+//!   Topics: ("initialized",), Data: (admin, bot_nft, fee_bps)
 //! - `listed`: Emitted when a bot is listed for sale.
 //!   Topics: ("listed", seller, listing_id), Data: (bot_id, price)
 //! - `sold`: Emitted when a bot is purchased.
@@ -16,15 +65,16 @@
 //!   Topics: ("cancel", seller, listing_id), Data: (bot_id,)
 //! - `fee_bps_updated`: Emitted when fee basis points change.
 //!   Topics: ("fee_bps_updated",), Data: (old_fee_bps, new_fee_bps)
-//! - `fee_recipient_updated`: Emitted when fee recipient changes.
-//!   Topics: ("fee_recipient_updated",), Data: (old_recipient, new_recipient)
+//! - `min_price_updated`: Emitted when min_price for a currency changes.
+//!   Topics: ("min_price_updated", currency), Data: (old_min, new_min)
 //! - `bot_nft_updated`: Emitted when bot NFT address changes.
 //!   Topics: ("bot_nft_updated",), Data: (old_nft, new_nft)
 //! - `admin_updated`: Emitted when admin changes.
 //!   Topics: ("admin_updated",), Data: (old_admin, new_admin)
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    Vec,
 };
 
 use automint_bot_nft::{BotNFTContractClient, BotTier};
@@ -39,6 +89,7 @@ pub enum DataKey {
     NextListingId,
     Config,
     Initialized,
+    MinPrice(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +139,9 @@ pub enum MarketplaceError {
     Unauthorized = 10,
     PaymentFailed = 11,
     Overflow = 12,
+    PriceTooLow = 13,
+    ListingStale = 14,
+    SelfPurchase = 15,
 }
 
 const LEDGER_BUMP: u32 = 120960;
@@ -110,15 +164,81 @@ impl MarketplaceContract {
             return Err(MarketplaceError::AlreadyInitialized);
         }
         admin.require_auth();
-        let config = Config { bot_nft: bot_nft.clone(), admin: admin.clone(), fee_bps: FEE_BPS, fee_recipient: fee_recipient.clone() };
+        let config = Config {
+            admin: admin.clone(),
+            bot_nft: bot_nft.clone(),
+            fee_bps,
+        };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::NextListingId, &1u64);
-        env.storage().instance().set(&DataKey::ActiveListings, &Vec::<u64>::new(&env));
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveListings, &Vec::<u64>::new(&env));
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
-            symbol_short!("initialized"),
-            (admin, bot_nft, fee_recipient),
+            (Symbol::new(&env, "initialized"),),
+            (admin, bot_nft, fee_bps),
+        );
+        Ok(())
+    }
+
+    /// Return the next listing ID that will be assigned (i.e. `NextListingId`).
+    /// This is the public enumeration cursor — tooling should use it instead of
+    /// scanning `get_listing` over an unbounded range. The value is `1` before
+    /// any listing has been created.
+    pub fn next_listing_id(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextListingId)
+            .unwrap_or(1)
+    }
+
+    /// Return the configured minimum price for `currency`. If the admin has not
+    /// set an explicit floor, the default `ceil(10_000/fee_bps)` (or `1` when
+    /// `fee_bps == 0`) is returned. Every accepted price guarantees
+    /// `price * fee_bps / 10_000 >= 1` when `fee_bps > 0`.
+    pub fn get_min_price(env: Env, currency: Address) -> i128 {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(Config {
+                admin: currency.clone(),
+                bot_nft: currency.clone(),
+                fee_bps: 250,
+            });
+        Self::min_price_for_currency(&env, &currency, config.fee_bps)
+    }
+
+    /// Admin-only: set the minimum price for `currency`. `min_price` must be
+    /// strictly positive. Emits `min_price_updated`.
+    pub fn set_min_price(
+        env: Env,
+        currency: Address,
+        min_price: i128,
+    ) -> Result<(), MarketplaceError> {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+        if min_price <= 0 {
+            return Err(MarketplaceError::InvalidPrice);
+        }
+        let old: Option<i128> = env.storage().instance().get(&DataKey::MinPrice(currency.clone()));
+        env.storage()
+            .instance()
+            .set(&DataKey::MinPrice(currency.clone()), &min_price);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            (Symbol::new(&env, "min_price"), currency.clone()),
+            (old.unwrap_or(0), min_price),
         );
         Ok(())
     }
@@ -144,6 +264,13 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Config)
             .ok_or(MarketplaceError::NotInitialized)?;
+
+        // Enforce per-currency floor: price must be >= min_price(currency).
+        // The default guarantees fee >= 1 base unit when fee_bps > 0.
+        let min_price = Self::min_price_for_currency(&env, &currency, config.fee_bps);
+        if price < min_price {
+            return Err(MarketplaceError::PriceTooLow);
+        }
 
         // Fetch the bot's tier from the NFT contract.
         let bot_client = BotNFTContractClient::new(&env, &config.bot_nft);
@@ -176,7 +303,7 @@ impl MarketplaceContract {
             bot_id,
             bot_tier,
             price,
-            currency,
+            currency: currency.clone(),
             listed_at: env.ledger().timestamp(),
             active: true,
         };
@@ -231,30 +358,99 @@ impl MarketplaceContract {
             .get(&DataKey::Listing(listing_id))
             .ok_or(MarketplaceError::ListingNotFound)?;
         if !listing.active {
-            return Err(MarketplaceError::ListingInactive);
+            return Err(MarketplaceError::ListingNotActive);
         }
         if listing.seller == buyer {
             return Err(MarketplaceError::SelfPurchase);
         }
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
-        let marketplace = env.current_contract_address();
-        let fee = listing.price * (config.fee_bps as i128) / 10_000;
-        let seller_amount = listing.price - fee;
-        let token = TokenClient::new(&env, &listing.currency);
-        token.transfer(&buyer, &listing.seller, &seller_amount);
-        if fee > 0 {
-            token.transfer(&buyer, &config.fee_recipient, &fee);
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+
+        // Verify the marketplace still owns the escrowed bot before moving any
+        // funds. If the bot is missing or has been reassigned (admin action,
+        // bug, future non-custodial path) we mark the listing stale, remove it
+        // from the active index, and return `ListingStale` *before* the payment
+        // leg so the buyer's balance is untouched.
+        let bot_client = BotNFTContractClient::new(&env, &config.bot_nft);
+        let bot = match bot_client.try_get_bot(&listing.bot_id) {
+            Ok(Ok(b)) => b,
+            _ => {
+                listing.active = false;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Listing(listing_id), &listing);
+                Self::remove_active_listing(&env, listing_id);
+                return Err(MarketplaceError::ListingStale);
+            }
+        };
+        if bot.owner != env.current_contract_address() {
+            listing.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Listing(listing_id), &listing);
+            Self::remove_active_listing(&env, listing_id);
+            return Err(MarketplaceError::ListingStale);
         }
-        call_bot_transfer(&env, &config.bot_nft, &marketplace, &buyer, listing.bot_id);
+
+        // 2.5% fee (250 bps) by default, guarded against overflow.
+        let fee = listing
+            .price
+            .checked_mul(config.fee_bps as i128)
+            .ok_or(MarketplaceError::Overflow)?
+            .checked_div(10_000)
+            .ok_or(MarketplaceError::Overflow)?;
+        let seller_amount = listing
+            .price
+            .checked_sub(fee)
+            .ok_or(MarketplaceError::Overflow)?;
+
+        // Transfer the NFT first. If payment later fails the buyer already
+        // holds the bot, which is preferable to the reverse (payment moved but
+        // bot not received) because payment is reversible via governance.
+        let marketplace = env.current_contract_address();
+        if bot_client
+            .try_transfer(&listing.bot_id, &marketplace, &buyer)
+            .is_err()
+        {
+            return Err(MarketplaceError::BotTransferFailed);
+        }
+
+        // Now handle payment transfers.
+        let token_client = token::Client::new(&env, &listing.currency);
+        if token_client
+            .try_transfer(&buyer, &listing.seller, &seller_amount)
+            .is_err()
+        {
+            return Err(MarketplaceError::PaymentFailed);
+        }
+        if fee > 0 {
+            if token_client
+                .try_transfer(&buyer, &config.admin, &fee)
+                .is_err()
+            {
+                return Err(MarketplaceError::PaymentFailed);
+            }
+        }
+
         listing.active = false;
-        env.storage().persistent().set(&DataKey::Listing(listing_id), &listing);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(listing_id), &listing);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Listing(listing_id),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
         Self::remove_active_listing(&env, listing_id);
         let purchase = Purchase {
             listing_id,
             bot_id: listing.bot_id,
             seller: listing.seller.clone(),
             price: listing.price,
-            currency: listing.currency,
+            currency: listing.currency.clone(),
             purchased_at: env.ledger().timestamp(),
         };
         Self::add_user_purchase(&env, &buyer, purchase);
@@ -333,12 +529,16 @@ impl MarketplaceContract {
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("cancelled"), seller, listing_id),
+            (symbol_short!("cancel"), seller, listing_id),
             listing.bot_id,
         );
         Ok(())
     }
 
+    /// Retrieve a listing by ID. Historical listings (bought/cancelled/stale)
+    /// remain readable with `active == false`; only an ID that was never
+    /// assigned returns `ListingNotFound`. This is intentional (see module
+    /// docs): auditability over hiding.
     pub fn get_listing(env: Env, listing_id: u64) -> Result<Listing, MarketplaceError> {
         env.storage()
             .persistent()
@@ -366,7 +566,6 @@ impl MarketplaceContract {
     /// callers.
     pub fn get_active_listings(env: Env, start: u64, limit: u32) -> Vec<Listing> {
         let mut result: Vec<Listing> = Vec::new(&env);
-        // A request for zero items is trivially satisfied with an empty vec.
         if limit == 0 {
             return result;
         }
@@ -375,6 +574,8 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::ActiveListings)
             .unwrap_or_else(|| Vec::new(&env));
+        let marketplace = env.current_contract_address();
+        let config: Option<Config> = env.storage().instance().get(&DataKey::Config);
         let mut count: u32 = 0;
         for (i, id) in active_ids.iter().enumerate() {
             if (i as u64) < start {
@@ -389,6 +590,19 @@ impl MarketplaceContract {
                 .get::<_, Listing>(&DataKey::Listing(id))
             {
                 if l.active {
+                    // Filter stale listings where marketplace no longer owns the bot.
+                    // This ensures a listing that became stale (e.g. via admin
+                    // transfer) stops appearing even though the `buy_bot` stale
+                    // path returns an error and the host reverts the
+                    // `active=false` write. See module docs for enumeration
+                    // design.
+                    if let Some(cfg) = config.as_ref() {
+                        let bot_client = BotNFTContractClient::new(&env, &cfg.bot_nft);
+                        match bot_client.try_get_bot(&l.bot_id) {
+                            Ok(Ok(bot)) if bot.owner == marketplace => {}
+                            _ => continue,
+                        }
+                    }
                     result.push_back(l);
                     count += 1;
                 }
@@ -423,13 +637,13 @@ impl MarketplaceContract {
             .get::<_, Vec<Purchase>>(&DataKey::UserPurchases(buyer))
             .unwrap_or_else(|| Vec::new(&env));
         let mut result: Vec<Purchase> = Vec::new(&env);
-        let start = if purchases.len() > limit as usize {
-            purchases.len() - (limit as usize)
+        let start = if purchases.len() > limit {
+            purchases.len() - limit
         } else {
             0
         };
         for i in start..purchases.len() {
-            result.push_back(purchases.get(i as u32).unwrap().clone());
+            result.push_back(purchases.get(i).unwrap().clone());
         }
         result
     }
@@ -450,26 +664,8 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
-            symbol_short!("fee_bps_updated"),
+            (Symbol::new(&env, "fee_bps_upd"),),
             (old_fee_bps, new_fee_bps),
-        );
-        Ok(())
-    }
-
-    pub fn set_fee_recipient(env: Env, new_recipient: Address) -> Result<(), MarketplaceError> {
-        let mut config: Config = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(MarketplaceError::NotInitialized)?;
-        config.admin.require_auth();
-        let old_recipient = config.fee_recipient.clone();
-        config.fee_recipient = new_recipient;
-        env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
-        env.events().publish(
-            symbol_short!("fee_recipient_updated"),
-            (old_recipient, config.fee_recipient.clone()),
         );
         Ok(())
     }
@@ -486,7 +682,7 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
-            symbol_short!("bot_nft_updated"),
+            (Symbol::new(&env, "bot_nft_upd"),),
             (old_nft, config.bot_nft.clone()),
         );
         Ok(())
@@ -504,7 +700,7 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
-            symbol_short!("admin_updated"),
+            (Symbol::new(&env, "admin_upd"),),
             (old_admin, config.admin.clone()),
         );
         Ok(())
@@ -523,6 +719,9 @@ impl MarketplaceContract {
             }
         }
         env.storage().instance().set(&DataKey::ActiveListings, &new_active);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
     }
 
     fn add_user_purchase(env: &Env, buyer: &Address, purchase: Purchase) {
@@ -532,222 +731,30 @@ impl MarketplaceContract {
             .get::<_, Vec<Purchase>>(&DataKey::UserPurchases(buyer.clone()))
             .unwrap_or_else(|| Vec::new(env));
         purchases.push_back(purchase);
-        env.storage().persistent().set(&DataKey::UserPurchases(buyer.clone()), &purchases);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserPurchases(buyer.clone()), &purchases);
         env.storage().persistent().extend_ttl(
             &DataKey::UserPurchases(buyer.clone()),
             LEDGER_THRESHOLD,
             LEDGER_BUMP,
         );
     }
-}
 
-        let mut listing: Listing = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Listing(listing_id))
-            .ok_or(MarketplaceError::ListingNotFound)?;
-
-        if !listing.active {
-            return Err(MarketplaceError::ListingNotActive);
-        }
-
-    #[test]
-    fn test_buy_bot() {
-        let env = Env::default();
-        let (admin, bot, tok, mkt) = setup(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        tok.mint(&buyer, &1000_0000000_i128);
-        let bot_nft_id = bot.mint_basic(&seller).unwrap();
-        mkt.list_bot(&seller, &bot_nft_id, &0u32, &100_0000000_i128, &tok.address).unwrap();
-        mkt.buy_bot(&buyer, &1u64).unwrap();
-        assert_eq!(bot.get_user_bots(&buyer).len(), 1);
-        assert_eq!(bot.get_user_bots(&seller).len(), 0);
-        let fee = 100_0000000_i128 * 250 / 10_000;
-        assert_eq!(tok.balance(&admin), fee);
-        assert_eq!(tok.balance(&seller), 100_0000000_i128 - fee);
-    }
-
-        // 2.5% fee (250 basis points), guarded against overflow instead of
-        // panicking on an extreme listing price.
-        let fee = listing
-            .price
-            .checked_mul(25)
-            .and_then(|v| v.checked_div(1000))
-            .ok_or(MarketplaceError::Overflow)?;
-        let seller_payment = listing
-            .price
-            .checked_sub(fee)
-            .ok_or(MarketplaceError::Overflow)?;
-
-        // Transfer bot NFT first (most critical asset). If this succeeds but
-        // payment fails, buyer has the bot. This is preferable to buyer sending
-        // payment but not receiving the bot (payment is reversible via governance,
-        // NFT transfer is not).
-        let marketplace = env.current_contract_address();
-        let bot_client = BotNFTContractClient::new(&env, &config.bot_nft);
-        if bot_client
-            .try_transfer(&listing.bot_id, &marketplace, &buyer)
-            .is_err()
-        {
-            return Err(MarketplaceError::BotTransferFailed);
-        }
-
-        // Now handle payment transfers. Fee transfer failure is swallowed to avoid
-        // aborting the entire purchase if only the admin fee fails.
-        let token_client = token::Client::new(&env, &listing.currency);
-        if token_client
-            .try_transfer(&buyer, &listing.seller, &seller_payment)
-            .is_err()
-        {
-            return Err(MarketplaceError::PaymentFailed);
-        }
-        if fee > 0 {
-            let _ = token_client.try_transfer(&buyer, &config.admin, &fee);
-        }
-
-        listing.active = false;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Listing(listing_id), &listing);
-
-        let mut active: Vec<u64> = env
+    fn min_price_for_currency(env: &Env, currency: &Address, fee_bps: u32) -> i128 {
+        if let Some(v) = env
             .storage()
             .instance()
-            .get(&DataKey::ActiveListings)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_active: Vec<u64> = Vec::new(&env);
-        for id in active.iter() {
-            if id != listing_id {
-                new_active.push_back(id);
-            }
+            .get::<_, i128>(&DataKey::MinPrice(currency.clone()))
+        {
+            return v;
         }
-        active = new_active;
-        env.storage()
-            .instance()
-            .set(&DataKey::ActiveListings, &active);
-        env.storage()
-            .instance()
-            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("bought"), buyer, listing_id),
-            (listing.bot_id, listing.price),
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_initialize_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let bot_nft_addr = env.register_contract(None, BotNFTContract);
-        let mkt_id = env.register_contract(None, MarketplaceContract);
-        let mkt = MarketplaceContractClient::new(&env, &mkt_id);
-        mkt.initialize(&admin, &bot_nft_addr, &admin);
-        let events = env.events().all();
-        assert!(events.len() >= 1);
-        let init_event = events.last().unwrap();
-        assert_eq!(init_event.0.get_unchecked(0), &symbol_short!("initialized").into_val(&env));
-    }
-
-    #[test]
-    fn test_user_purchase_history() {
-        let env = Env::default();
-        let (_, bot, tok, mkt) = setup(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        tok.mint(&buyer, &1000_0000000_i128);
-        let bot_id = bot.mint_basic(&seller).unwrap();
-        mkt.list_bot(&seller, &bot_id, &0u32, &100_0000000_i128, &tok.address).unwrap();
-        mkt.buy_bot(&buyer, &1u64).unwrap();
-        let purchases = mkt.get_user_purchases(&buyer, &10u32);
-        assert_eq!(purchases.len(), 1);
-        let purchase = purchases.get(0).unwrap();
-        assert_eq!(purchase.listing_id, 1);
-        assert_eq!(purchase.bot_id, bot_id);
-        assert_eq!(purchase.seller, seller);
-        assert_eq!(purchase.price, 100_0000000_i128);
-    }
-
-    #[test]
-    fn test_bounded_purchase_history() {
-        let env = Env::default();
-        let (_, bot, tok, mkt) = setup(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        tok.mint(&buyer, &10000_0000000_i128);
-        for i in 0u32..15 {
-            let bot_id = bot.mint_basic(&seller).unwrap();
-            mkt.list_bot(&seller, &bot_id, &0u32, &100_0000000_i128, &tok.address).unwrap();
-            mkt.buy_bot(&buyer, &(i as u64 + 1)).unwrap();
+        if fee_bps == 0 {
+            return 1;
         }
-        let all_purchases = mkt.get_user_purchases(&buyer, &100u32);
-        assert_eq!(all_purchases.len(), 15);
-        let limited_purchases = mkt.get_user_purchases(&buyer, &5u32);
-        assert_eq!(limited_purchases.len(), 5);
-        let last_purchase = limited_purchases.get(4).unwrap();
-        assert_eq!(last_purchase.listing_id, 15);
-    }
-
-    #[test]
-    fn test_empty_purchase_history() {
-        let env = Env::default();
-        let (_, _, _, mkt) = setup(&env);
-        let buyer = Address::generate(&env);
-        let purchases = mkt.get_user_purchases(&buyer, &10u32);
-        assert_eq!(purchases.len(), 0);
-    }
-
-    #[test]
-    fn test_set_fee_bps_emits_event() {
-        let env = Env::default();
-        let (_, _, _, mkt) = setup(&env);
-        let old_count = env.events().all().len();
-        mkt.set_fee_bps(&500u32).unwrap();
-        let events = env.events().all();
-        assert!(events.len() > old_count);
-        let config = mkt.config();
-        assert_eq!(config.fee_bps, 500);
-    }
-
-    #[test]
-    fn test_set_fee_recipient_emits_event() {
-        let env = Env::default();
-        let (_, _, _, mkt) = setup(&env);
-        let new_recipient = Address::generate(&env);
-        mkt.set_fee_recipient(&new_recipient).unwrap();
-        let config = mkt.config();
-        assert_eq!(config.fee_recipient, new_recipient);
-    }
-
-    #[test]
-    fn test_set_bot_nft_emits_event() {
-        let env = Env::default();
-        let (_, _, _, mkt) = setup(&env);
-        let new_nft = Address::generate(&env);
-        mkt.set_bot_nft(&new_nft).unwrap();
-        let config = mkt.config();
-        assert_eq!(config.bot_nft, new_nft);
-    }
-
-    #[test]
-    fn test_set_admin_emits_event() {
-        let env = Env::default();
-        let (admin, _, _, mkt) = setup(&env);
-        let new_admin = Address::generate(&env);
-        mkt.set_admin(&new_admin).unwrap();
-        let config = mkt.config();
-        assert_eq!(config.admin, new_admin);
-    }
-
-    #[test]
-    fn test_unauthorized_set_fee_bps_fails() {
-        let env = Env::default();
-        let (_, _, _, mkt) = setup(&env);
-        env.mock_all_auths_allowing_non_root_auth();
-        assert!(mkt.try_set_fee_bps(&500u32).is_err());
+        // ceil(10_000 / fee_bps)
+        let denom = fee_bps as i128;
+        (10_000 + denom - 1) / denom
     }
 }
 
