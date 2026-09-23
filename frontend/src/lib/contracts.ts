@@ -17,7 +17,7 @@ import {
   STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
-import { getServer, simulateContractCall, buildPreparedTx } from "./stellar";
+import { getServer, simulateContractCall } from "./stellar";
 import { withRetry } from "./rpcRetry";
 import { useWalletStore } from "@/store/walletStore";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
@@ -65,9 +65,19 @@ function defaultSource(sourceAddress?: string): string {
  * Build a state-changing transaction that invokes `method(...args)` on
  * `contractId` and return its base64 XDR for the wallet to sign.
  *
- * Delegates to {@link buildPreparedTx}, which simulates the call so the
- * returned XDR carries the correct Soroban resource fee and footprint, not
- * just the BASE_FEE inclusion fee.
+ * Soroban requires every invocation to carry a *resource footprint*
+ * (read/write ledger keys) and a *resource fee* (CPU + storage rent) that
+ * varies per contract and per call. `BASE_FEE` alone only covers the
+ * classic-operation inclusion fee. This helper therefore:
+ *   1. Builds a bare transaction with `BASE_FEE`.
+ *   2. Simulates it via `server.simulateTransaction`.
+ *   3. On simulation error, throws the decoded diagnostic so the UI can
+ *      surface a readable message and the call fails at *build* time rather
+ *      than on-chain with `txSOROBAN_INVALID`.
+ *   4. Otherwise assembles the foot-print and resource fee into the
+ *      transaction via `SorobanRpc.assembleTransaction(tx, sim).build()`
+ *      and returns the resulting XDR — which now carries a non-empty
+ *      `sorobanData` footprint and a fee reflecting the simulated cost.
  */
 async function buildTxXdr(
   contractId: string,
@@ -75,7 +85,26 @@ async function buildTxXdr(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<string> {
-  return buildPreparedTx(contractId, method, args, sourceAddress);
+  const server = getServer();
+  const contract = new Contract(contractId);
+  const account = await server.getAccount(sourceAddress);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(TX_TIMEOUT)
+    .build();
+
+  const sim = await withRetry(() => server.simulateTransaction(tx));
+
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed for ${method}: ${sim.error}`);
+  }
+
+  const assembled = SorobanRpc.assembleTransaction(tx, sim).build();
+  return assembled.toXDR();
 }
 
 /**
