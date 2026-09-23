@@ -1,4 +1,5 @@
 import { useCallback, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { requestAccess, getAddress, getNetwork } from "@stellar/freighter-api";
 import { toast } from "sonner";
 import {
@@ -15,11 +16,44 @@ import {
   selectDisconnect,
 } from "@/store/walletStore";
 import { STELLAR_NETWORK_PASSPHRASE } from "@/lib/constants";
+import { qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
 
 const FREIGHTER_DOWNLOAD_URL = "https://freighter.app";
 
 function isFreighterInstalled(): boolean {
   return typeof window !== "undefined" && "freighter" in window;
+}
+
+/** Truncate a Stellar public key to a readable "G…XXXX" label for toasts. */
+function shortKey(pk: string): string {
+  return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
+}
+
+/**
+ * Remove every React Query cache entry that is keyed to a specific wallet
+ * address. Called when the connected account changes so the new account never
+ * sees stale data from the previous session.
+ *
+ * We remove rather than invalidate: an invalidated entry stays in the cache
+ * and triggers an immediate background refetch with the old address still
+ * interpolated into the key. Removal drops it cleanly; the new address drives
+ * fresh queries as hooks re-run with the updated `publicKey`.
+ */
+function evictAddressCache(queryClient: ReturnType<typeof useQueryClient>, address: string): void {
+  const addressScoped: Array<ReturnType<typeof qk[keyof typeof qk]>> = [
+    qk.registered(address),
+    qk.profile(address),
+    qk.bots(address),
+    qk.accrualState(address),
+    qk.amtBalance(address),
+    qk.dashboard(address),
+    qk.myListings(address),
+  ];
+  for (const key of addressScoped) {
+    queryClient.removeQueries({ queryKey: key });
+  }
+  // botDetails is keyed by address + botId — remove the whole address subtree.
+  queryClient.removeQueries({ queryKey: ["botDetails", address] });
 }
 
 /**
@@ -32,6 +66,18 @@ function isFreighterInstalled(): boolean {
  * re-render every consumer whenever a failed connection attempt sets an
  * error message. Read them with {@link useWalletNetwork} and
  * {@link useWalletError} in the components that actually show them.
+ *
+ * Background polling (#457)
+ * ─────────────────────────
+ * While connected, a single effect polls both `getAddress()` and `getNetwork()`
+ * on `DASHBOARD_POLL_MS` interval and on every `window focus` event. Two
+ * independent changes are handled:
+ *
+ *   • Account switch: the store is updated to the new public key, all cache
+ *     entries scoped to the previous address are evicted, and a toast names
+ *     the incoming account.
+ *   • Network switch: `networkMismatch` is updated, triggering the AM-138
+ *     mismatch banner if the new network differs from `STELLAR_NETWORK_PASSPHRASE`.
  */
 export function useWallet() {
   const status = useWalletStore(selectStatus);
@@ -43,6 +89,8 @@ export function useWallet() {
   const setNetworkMismatch = useWalletStore(selectSetNetworkMismatch);
   const setError = useWalletStore(selectSetError);
   const disconnect = useWalletStore(selectDisconnect);
+
+  const queryClient = useQueryClient();
 
   const isConnecting = status === "connecting";
   const isNotInstalled = !isFreighterInstalled();
@@ -95,25 +143,74 @@ export function useWallet() {
     toast.success("Wallet disconnected");
   }, [disconnect]);
 
+  // -------------------------------------------------------------------------
+  // Background wallet state poll (#457)
+  //
+  // Polls both getAddress() and getNetwork() together so the two checks share
+  // one Freighter round-trip per interval. Runs every DASHBOARD_POLL_MS and
+  // immediately on each window-focus event (same pattern as the network-only
+  // effect it replaces).
+  //
+  // The effect is gated on `status === "connected"` so it never fires for a
+  // visitor who has not connected yet, and tears itself down if the user
+  // explicitly disconnects via the UI.
+  // -------------------------------------------------------------------------
   useEffect(() => {
     if (status !== "connected") return;
 
-    const checkNetwork = async () => {
+    const checkWalletState = async () => {
       try {
-        const net = await getNetwork();
-        setNetworkMismatch(net.networkPassphrase !== STELLAR_NETWORK_PASSPHRASE);
+        // Fetch both in parallel — two lightweight Freighter bridge calls.
+        const [{ address: freshAddress }, freshNet] = await Promise.all([
+          getAddress(),
+          getNetwork(),
+        ]);
+
+        // ── Account change ──────────────────────────────────────────────────
+        // Read the current store value inline (not from the closure) so we
+        // always compare against the latest state even if the effect captured
+        // an earlier render's `publicKey`.
+        const currentKey = useWalletStore.getState().publicKey;
+        if (freshAddress && freshAddress !== currentKey) {
+          // Evict all cache entries keyed to the old address before updating
+          // the store. Evicting first means no query observer can fire with
+          // the old key between the two operations.
+          if (currentKey) {
+            evictAddressCache(queryClient, currentKey);
+          }
+          setConnected(freshAddress, freshNet.networkPassphrase);
+          toast.info(
+            `Account switched to ${shortKey(freshAddress)}`,
+            { id: "account-switch", duration: 5000 },
+          );
+        }
+
+        // ── Network change ──────────────────────────────────────────────────
+        const isMismatch = freshNet.networkPassphrase !== STELLAR_NETWORK_PASSPHRASE;
+        const currentMismatch = useWalletStore.getState().networkMismatch;
+        if (isMismatch !== currentMismatch) {
+          setNetworkMismatch(isMismatch);
+          if (isMismatch) {
+            toast.warning(
+              "Network mismatch — Freighter is on a different network. Please switch to Testnet.",
+              { id: "network-mismatch", duration: 8000 },
+            );
+          }
+        }
       } catch {
-        // Freighter locked or uninstalled — ignore
+        // Freighter locked, extension uninstalled, or bridge unavailable —
+        // silently skip this tick. The user can reconnect via the connect
+        // button; we don't force-disconnect on a transient error.
       }
     };
 
-    const id = setInterval(checkNetwork, 30_000);
-    window.addEventListener("focus", checkNetwork);
+    const intervalId = setInterval(checkWalletState, DASHBOARD_POLL_MS);
+    window.addEventListener("focus", checkWalletState);
     return () => {
-      clearInterval(id);
-      window.removeEventListener("focus", checkNetwork);
+      clearInterval(intervalId);
+      window.removeEventListener("focus", checkWalletState);
     };
-  }, [status, setNetworkMismatch]);
+  }, [status, setConnected, setNetworkMismatch, queryClient]);
 
   return {
     status,

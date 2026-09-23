@@ -26,9 +26,11 @@ export const NETWORK = process.env.NEXT_PUBLIC_NETWORK ?? "TESTNET";
  * leaderboard still sees active listings and rankings. Must be a real, funded
  * account on the configured network; it is never used to sign or submit a
  * transaction.
+ *
+ * Configured via {@link NEXT_PUBLIC_SIMULATION_SOURCE} in `.env.local`.
  */
 export const ANONYMOUS_READ_SOURCE =
-  process.env.NEXT_PUBLIC_READ_SOURCE_ACCOUNT ?? "";
+  process.env.NEXT_PUBLIC_SIMULATION_SOURCE ?? "";
 
 /** Horizon URL for account/transaction queries. */
 export const HORIZON_URL =

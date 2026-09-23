@@ -19,6 +19,7 @@ import {
 } from "./constants";
 import { getServer, simulateContractCall, buildPreparedTx } from "./stellar";
 import { withRetry } from "./rpcRetry";
+import { useWalletStore } from "@/store/walletStore";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
 const toBigInt = (v: unknown): bigint =>
@@ -28,17 +29,36 @@ const toBigInt = (v: unknown): bigint =>
  * Resolve the source address used for read-only simulations that have no
  * natural per-user address. Simulations don't sign, so any loadable account
  * works; the connected wallet's public key is the sensible default. A
- * configured {@link ANONYMOUS_READ_SOURCE} lets disconnected visitors still
- * read public data (marketplace listings, leaderboard) before they connect.
+ * configured {@link ANONYMOUS_READ_SOURCE} (via `NEXT_PUBLIC_SIMULATION_SOURCE`)
+ * lets disconnected visitors still read public data (marketplace listings,
+ * leaderboard) before they connect.
+ *
+ * Priority order:
+ *   1. An explicit `sourceAddress` argument — callers that already have an
+ *      address pass it directly and bypass the store lookup.
+ *   2. The currently connected wallet's public key, read from the Zustand
+ *      store snapshot (safe outside React components, no hook needed).
+ *   3. The {@link ANONYMOUS_READ_SOURCE} env-var fallback — a funded testnet
+ *      account configured by the operator so unauthenticated visitors can
+ *      browse the marketplace and leaderboard.
+ *
+ * @throws {Error} when none of the three sources is available, so callers
+ *   receive a clear diagnostic rather than a mysterious RPC failure.
  */
 function defaultSource(sourceAddress?: string): string {
   if (sourceAddress) return sourceAddress;
-  if (typeof window !== "undefined") {
-    const win = window as unknown as { selectedPublicKey?: string };
-    if (win.selectedPublicKey) return win.selectedPublicKey;
-  }
+
+  // Zustand's getState() is synchronous and safe to call outside React.
+  // It returns null when no wallet is connected rather than undefined.
+  const walletKey = useWalletStore.getState().publicKey;
+  if (walletKey) return walletKey;
+
   if (ANONYMOUS_READ_SOURCE) return ANONYMOUS_READ_SOURCE;
-  throw new Error("No source address available for contract simulation");
+
+  throw new Error(
+    "No simulation source available. " +
+    "Connect a wallet or set NEXT_PUBLIC_SIMULATION_SOURCE in .env.local."
+  );
 }
 
 /**
@@ -178,6 +198,10 @@ export async function buyBot(address: string, listingId: bigint): Promise<string
 
 /**
  * Fetch the leaderboard of top users by points.
+ *
+ * Errors propagate to the caller — an RPC outage will throw rather than
+ * return an empty list, so React Query's `isError` path fires and the UI
+ * can surface a retry button instead of silently showing "No entries".
  */
 export async function getLeaderboard(
   limit: number = 50,
@@ -189,7 +213,13 @@ export async function getLeaderboard(
     [nativeToScVal(limit, { type: "u32" })],
     defaultSource(sourceAddress)
   );
-  if (!Array.isArray(raw)) return [];
+  // The contract always returns an array; a non-array means a schema mismatch
+  // (e.g. wrong contract ID), not an empty leaderboard.
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      `get_leaderboard returned unexpected type ${typeof raw}; expected array`
+    );
+  }
   return raw.map((entry: Record<string, unknown>) => parseUserProfile(entry));
 }
 
@@ -327,7 +357,11 @@ export async function cancelListing(
 
 /**
  * Get all active marketplace listings.
- * Returns array of listing objects.
+ *
+ * Errors propagate to the caller so React Query's `isError` path fires on an
+ * RPC outage rather than silently returning an empty list. A non-array return
+ * value indicates a schema mismatch (wrong contract ID or ABI change) and is
+ * also treated as an error rather than collapsed to [].
  */
 export async function getActiveListings(
   start: number = 0,
@@ -343,13 +377,20 @@ export async function getActiveListings(
     ],
     defaultSource(sourceAddress)
   );
-  if (!Array.isArray(listingsRaw)) return [];
+  if (!Array.isArray(listingsRaw)) {
+    throw new Error(
+      `get_active_listings returned unexpected type ${typeof listingsRaw}; expected array`
+    );
+  }
   return listingsRaw.map((listing: Record<string, unknown>) => parseListing(listing));
 }
 
 /**
  * Get marketplace listings for a specific user.
- * Returns array of listings where user is the seller.
+ *
+ * Errors propagate to the caller so React Query's `isError` path fires on an
+ * RPC outage. A non-array return indicates a schema mismatch and is thrown
+ * rather than silently collapsed to [].
  */
 export async function getUserListings(
   userAddress: string
@@ -360,13 +401,21 @@ export async function getUserListings(
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  if (!Array.isArray(listingsRaw)) return [];
+  if (!Array.isArray(listingsRaw)) {
+    throw new Error(
+      `get_user_listings returned unexpected type ${typeof listingsRaw}; expected array`
+    );
+  }
   return listingsRaw.map((listing: Record<string, unknown>) => parseListing(listing));
 }
 
 /**
  * Check whether an address is registered in the registry contract.
  * Read-only simulation of the registry's `is_registered` method.
+ *
+ * Errors propagate to the caller — a network failure must never be
+ * mistaken for `false`, which would prompt an already-registered user
+ * to re-register.
  */
 export async function isRegistered(userAddress: string): Promise<boolean> {
   const result = await simulateContractCall(
@@ -381,6 +430,10 @@ export async function isRegistered(userAddress: string): Promise<boolean> {
 /**
  * Get the total number of registered users from the registry contract.
  * Read-only simulation of the registry's `total_users` method.
+ *
+ * Errors propagate to the caller. A null/undefined return is not a valid
+ * contract response and is treated as an error rather than silently
+ * returned as 0.
  */
 export async function getTotalUsers(sourceAddress?: string): Promise<number> {
   const result = await simulateContractCall(
@@ -389,7 +442,10 @@ export async function getTotalUsers(sourceAddress?: string): Promise<number> {
     [],
     defaultSource(sourceAddress)
   );
-  return Number(result ?? 0);
+  if (result === null || result === undefined) {
+    throw new Error("total_users returned no value");
+  }
+  return Number(result);
 }
 
 /**
@@ -437,14 +493,25 @@ export async function startAccrual(userAddress: string, rate: number): Promise<s
 
 /**
  * Get accrual state for a user from the accrual contract.
+ *
+ * Returns `null` only when the contract explicitly reports `NotFound`
+ * (error code #2) or `NotRegistered` (error code #1) — meaning the address
+ * has no accrual record yet. Every other error (RPC outage, wrong contract
+ * ID, …) propagates so React Query's `isError` path fires.
  */
 export async function getAccrualState(userAddress: string): Promise<AccrualState | null> {
-  const stateRaw = (await simulateContractCall(
-    ACCRUAL_CONTRACT_ID,
-    "get_accrual_state",
-    [nativeToScVal(userAddress, { type: "address" })],
-    userAddress
-  )) as Record<string, unknown> | null;
+  let stateRaw: Record<string, unknown> | null;
+  try {
+    stateRaw = (await simulateContractCall(
+      ACCRUAL_CONTRACT_ID,
+      "get_accrual_state",
+      [nativeToScVal(userAddress, { type: "address" })],
+      userAddress
+    )) as Record<string, unknown> | null;
+  } catch (err) {
+    if (isNotFoundError(err) || isNotRegisteredError(err)) return null;
+    throw err;
+  }
 
   if (!stateRaw) return null;
 
@@ -501,15 +568,60 @@ export async function claimPoints(userAddress: string): Promise<string> {
 }
 
 /**
+ * Return true when the simulation error represents the contract-defined
+ * "NotRegistered" variant (error code #1 in the registry contract).
+ *
+ * The RPC wraps the Soroban diagnostic in a plain Error whose message
+ * contains the contract error code, e.g.:
+ *   "Simulation failed for get_user: Error(Contract, #1)"
+ *
+ * Matching by the specific code prevents RPC outages, wrong contract IDs,
+ * or any other network-layer failure from being silently swallowed.
+ */
+function isNotRegisteredError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  // Registry contract error code 1 = NotRegistered (ARCHITECTURE.md §Error Codes).
+  return (
+    msg.includes("NotRegistered") ||
+    /Error\(Contract,\s*#1\b/.test(msg)
+  );
+}
+
+/**
+ * Return true when the simulation error represents the contract-defined
+ * "NotFound" variant (error code #2 in the accrual contract).
+ */
+function isNotFoundError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return (
+    msg.includes("NotFound") ||
+    /Error\(Contract,\s*#2\b/.test(msg)
+  );
+}
+
+/**
  * Get user profile from the registry contract.
+ *
+ * Returns `null` only when the contract explicitly reports `NotRegistered`
+ * (error code #1) — meaning the address has no profile. Every other error
+ * (RPC outage, wrong contract ID, …) propagates so React Query's `isError`
+ * path fires and the UI can show a retry button.
  */
 export async function getUserProfile(userAddress: string): Promise<UserProfile | null> {
-  const profileRaw = (await simulateContractCall(
-    REGISTRY_CONTRACT_ID,
-    "get_user",
-    [nativeToScVal(userAddress, { type: "address" })],
-    userAddress
-  )) as Record<string, unknown> | null;
+  let profileRaw: Record<string, unknown> | null;
+  try {
+    profileRaw = (await simulateContractCall(
+      REGISTRY_CONTRACT_ID,
+      "get_user",
+      [nativeToScVal(userAddress, { type: "address" })],
+      userAddress
+    )) as Record<string, unknown> | null;
+  } catch (err) {
+    if (isNotRegisteredError(err)) return null;
+    throw err;
+  }
 
   if (!profileRaw) return null;
   return parseUserProfile(profileRaw);
