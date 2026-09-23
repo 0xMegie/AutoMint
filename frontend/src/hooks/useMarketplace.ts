@@ -1,112 +1,117 @@
-'use client';
-import { useCallback } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { toast } from 'sonner';
-import {
-  getActiveListings,
-  getUserListings,
-  listBot,
-  buyBot,
-  cancelListing,
-  mintTierBot,
-} from '@/lib/contracts';
-import { POLL_INTERVAL_MS } from '@/lib/constants';
-import type { Listing } from '@/types';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { buyBot as buyBotTx, mintTierBot as mintTierBotTx, getActiveListings, getUserListings, listBot, cancelListing } from "@/lib/contracts";
+import { useWalletStore, selectPublicKey } from "@/store/walletStore";
+import type { Tier } from "@/types";
+import { pollWhenVisible } from "@/lib/polling";
+import { STALE_TIME, GC_TIME, qk } from "@/lib/queryKeys";
 
-export function useMarketplace(publicKey: string | null) {
-  const qc = useQueryClient();
+export function useBuyBot() {
+  const queryClient = useQueryClient();
+  const publicKey = useWalletStore(selectPublicKey);
 
-  const { data: listings = [], isLoading: loadingListings, refetch: refetchListings } = useQuery({
-    queryKey: ['listings'],
-    queryFn: () => getActiveListings(0, 50),
-    refetchInterval: POLL_INTERVAL_MS,
+  return useMutation({
+    mutationFn: async (listingId: bigint) => {
+      if (!publicKey) throw new Error("Wallet not connected");
+      return buyBotTx(publicKey, listingId);
+    },
+    onSuccess: () => {
+      toast.success("Bot purchased successfully!");
+      queryClient.invalidateQueries({ queryKey: qk.listings() });
+      queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
+      queryClient.invalidateQueries({ queryKey: ["botDetails"] });
+      queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Failed to purchase bot");
+    },
   });
+}
 
-  const { data: myListings = [], isLoading: loadingMyListings } = useQuery({
-    queryKey: ['myListings', publicKey],
-    queryFn: () => getUserListings(publicKey!, publicKey!),
+export function useMintTierBot() {
+  const queryClient = useQueryClient();
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useMutation({
+    mutationFn: async ({ tier, token }: { tier: Tier; token: string }) => {
+      if (!publicKey) throw new Error("Wallet not connected");
+      return mintTierBotTx(publicKey, tier, token);
+    },
+    onSuccess: () => {
+      toast.success("Tier bot minted successfully!");
+      queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
+      queryClient.invalidateQueries({ queryKey: ["botDetails"] });
+      queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Failed to mint tier bot");
+    },
+  });
+}
+
+export function useListings() {
+  return useQuery({
+    queryKey: qk.listings(),
+    queryFn: () => getActiveListings(),
+    refetchInterval: pollWhenVisible(),
+    staleTime: STALE_TIME.SHORT,
+    gcTime: GC_TIME.SHORT,
+  });
+}
+
+export function useMyListings() {
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useQuery({
+    queryKey: qk.myListings(publicKey),
+    queryFn: () => (publicKey ? getUserListings(publicKey) : Promise.resolve([])),
     enabled: !!publicKey,
-    refetchInterval: POLL_INTERVAL_MS,
+    refetchInterval: pollWhenVisible(),
+    staleTime: STALE_TIME.SHORT,
+    gcTime: GC_TIME.SHORT,
   });
+}
 
-  const { mutateAsync: doList, isPending: isListing } = useMutation({
-    mutationFn: async ({
-      botId,
-      botTier,
-      priceStroops,
-      currencyAddress,
-    }: {
-      botId: bigint;
-      botTier: number;
-      priceStroops: bigint;
-      currencyAddress: string;
-    }) => {
-      if (!publicKey) throw new Error('Wallet not connected');
-      return listBot(publicKey, botId, botTier, priceStroops, currencyAddress);
+export function useListBot() {
+  const queryClient = useQueryClient();
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useMutation({
+    mutationFn: async ({ botId, price }: { botId: bigint; price: bigint }) => {
+      if (!publicKey) throw new Error("Wallet not connected");
+      return listBot(publicKey, botId, price);
     },
     onSuccess: () => {
-      toast.success('Bot listed for sale!');
-      qc.invalidateQueries({ queryKey: ['listings'] });
-      qc.invalidateQueries({ queryKey: ['myListings', publicKey] });
-      qc.invalidateQueries({ queryKey: ['bots', publicKey] });
+      toast.success("Bot listed successfully!");
+      queryClient.invalidateQueries({ queryKey: qk.listings() });
+      queryClient.invalidateQueries({ queryKey: qk.myListings(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
+      queryClient.invalidateQueries({ queryKey: ["botDetails"] });
     },
-    onError: (err) => toast.error(`Listing failed: ${err instanceof Error ? err.message : 'Error'}`),
+    onError: (error: Error) => {
+      toast.error(error.message || "Failed to list bot");
+    },
   });
+}
 
-  const { mutateAsync: doBuy, isPending: isBuying } = useMutation({
+export function useCancelListing() {
+  const queryClient = useQueryClient();
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useMutation({
     mutationFn: async (listingId: bigint) => {
-      if (!publicKey) throw new Error('Wallet not connected');
-      return buyBot(publicKey, listingId);
-    },
-    onSuccess: () => {
-      toast.success('Bot purchased!');
-      qc.invalidateQueries({ queryKey: ['listings'] });
-      qc.invalidateQueries({ queryKey: ['bots', publicKey] });
-      qc.invalidateQueries({ queryKey: ['accrualState', publicKey] });
-    },
-    onError: (err) => toast.error(`Purchase failed: ${err instanceof Error ? err.message : 'Error'}`),
-  });
-
-  const { mutateAsync: doMintTier, isPending: isMintingTier } = useMutation({
-    mutationFn: async (tierIndex: number) => {
-      if (!publicKey) throw new Error('Wallet not connected');
-      return mintTierBot(publicKey, tierIndex);
-    },
-    onSuccess: () => {
-      toast.success('Bot minted! Check your dashboard.');
-      qc.invalidateQueries({ queryKey: ['bots', publicKey] });
-      qc.invalidateQueries({ queryKey: ['accrualState', publicKey] });
-    },
-    onError: (err) => toast.error(`Mint failed: ${err instanceof Error ? err.message : 'Error'}`),
-  });
-
-  const { mutateAsync: doCancel, isPending: isCancelling } = useMutation({
-    mutationFn: async (listingId: bigint) => {
-      if (!publicKey) throw new Error('Wallet not connected');
+      if (!publicKey) throw new Error("Wallet not connected");
       return cancelListing(publicKey, listingId);
     },
     onSuccess: () => {
-      toast.success('Listing cancelled. Bot returned to your wallet.');
-      qc.invalidateQueries({ queryKey: ['listings'] });
-      qc.invalidateQueries({ queryKey: ['myListings', publicKey] });
-      qc.invalidateQueries({ queryKey: ['bots', publicKey] });
+      toast.success("Listing cancelled successfully!");
+      queryClient.invalidateQueries({ queryKey: qk.listings() });
+      queryClient.invalidateQueries({ queryKey: qk.myListings(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
+      queryClient.invalidateQueries({ queryKey: ["botDetails"] });
     },
-    onError: (err) => toast.error(`Cancel failed: ${err instanceof Error ? err.message : 'Error'}`),
+    onError: (error: Error) => {
+      toast.error(error.message || "Failed to cancel listing");
+    },
   });
-
-  return {
-    listings: listings as Listing[],
-    myListings: myListings as Listing[],
-    loadingListings,
-    loadingMyListings,
-    isListing,
-    isBuying,
-    isCancelling,
-    isMintingTier,
-    listBot: async (params: { botId: bigint; botTier: number; priceStroops: bigint; currencyAddress: string }) => { await doList(params); },
-    buyBot: async (listingId: bigint) => { await doBuy(listingId); },
-    cancelListing: async (listingId: bigint) => { await doCancel(listingId); },
-    mintTierBot: async (tierIndex: number) => { await doMintTier(tierIndex); },
-    refetch: refetchListings,
-  };
 }

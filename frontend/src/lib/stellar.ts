@@ -1,221 +1,235 @@
 import {
-  Address,
   Contract,
   SorobanRpc,
   TransactionBuilder,
-  nativeToScVal,
   scValToNative,
   xdr,
-} from '@stellar/stellar-sdk';
+  nativeToScVal,
+} from "@stellar/stellar-sdk";
 import {
-  isConnected,
-  requestAccess,
-  signTransaction,
-  getNetworkDetails,
-} from '@stellar/freighter-api';
-import {
-  SOROBAN_RPC_URL,
-  NETWORK_PASSPHRASE,
-  TX_TIMEOUT,
-  BASE_FEE,
-} from './constants';
+  isConnected as freighterIsConnected,
+  requestAccess as freighterRequestAccess,
+  getNetwork as freighterGetNetwork,
+} from "@stellar/freighter-api";
+import { BASE_FEE, SOROBAN_RPC_URL, STELLAR_NETWORK_PASSPHRASE } from "./constants";
+import { withRetry } from "./rpcRetry";
 
-// ── RPC server singleton ──────────────────────────────────────────────────────
-
+/**
+ * Module-level singleton — created once, reused on every subsequent call.
+ * Keeping a single instance avoids the overhead of re-establishing the
+ * HTTP connection on every RPC call.
+ */
 let _server: SorobanRpc.Server | null = null;
 
+/**
+ * Returns a memoized {@link SorobanRpc.Server} pointed at the configured
+ * {@link SOROBAN_RPC_URL}.  The instance is created on the first call and
+ * the same object is returned on every subsequent call.
+ */
 export function getServer(): SorobanRpc.Server {
   if (!_server) {
-    _server = new SorobanRpc.Server(SOROBAN_RPC_URL, { allowHttp: true });
+    _server = new SorobanRpc.Server(SOROBAN_RPC_URL, {
+      allowHttp: SOROBAN_RPC_URL.startsWith("http://"),
+    });
   }
   return _server;
 }
 
-// ── Wallet helpers ────────────────────────────────────────────────────────────
-
-export async function checkFreighter(): Promise<boolean> {
-  try {
-    const result = await isConnected();
-    return !!result.isConnected;
-  } catch {
-    return false;
+/**
+ * Heuristic for turning a Freighter API error (or thrown value) into a
+ * user-facing message. Freighter v3 returns `{ error: { code, message } }`
+ * objects rather than throwing, but older paths / the extension bridge can
+ * still throw, so we handle both.
+ */
+function describeFreighterError(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes("lock")) {
+    return "Your Freighter wallet is locked. Please unlock it and try again.";
   }
+  if (
+    lower.includes("reject") ||
+    lower.includes("denied") ||
+    lower.includes("declined") ||
+    lower.includes("cancel")
+  ) {
+    return "Connection request was rejected in Freighter.";
+  }
+  return message;
 }
 
-export async function connectFreighter(): Promise<{ publicKey: string; network: string }> {
-  // 1. Extension installed?
-  let installed = false;
+/**
+ * Trigger the Freighter authorization popup and return the connected wallet's
+ * public key and network.
+ *
+ * Throws descriptive {@link Error}s for the common failure modes so the UI can
+ * catch and display them:
+ * - Freighter extension not installed / not detected
+ * - wallet locked
+ * - user rejected the access request
+ *
+ * @returns the connected account's `publicKey` and its `network` label
+ */
+export async function connectFreighter(): Promise<{
+  publicKey: string;
+  network: string;
+}> {
+  // 1. Detect the extension. `isConnected` reports whether Freighter is
+  //    installed and reachable in the current browser.
+  let connected: { isConnected: boolean; error?: { message: string } };
   try {
-    const r = await isConnected();
-    installed = !!r.isConnected;
+    connected = await freighterIsConnected();
   } catch {
-    installed = false;
-  }
-  if (!installed) throw new Error('FREIGHTER_NOT_INSTALLED');
-
-  // 2. requestAccess() is the correct v3 entry point:
-  //    - Shows "Allow this site?" popup if not yet authorized
-  //    - Shows unlock screen if wallet is locked
-  //    - Returns address once the user approves
-  const access = await requestAccess();
-  if (access.error || !access.address) {
-    const raw = (access.error ?? '').toLowerCase();
-    if (raw.includes('reject') || raw.includes('denied') || raw.includes('cancel')) {
-      throw new Error('Connection cancelled. Approve AutoMint in the Freighter popup and try again.');
-    }
-    if (raw.includes('unlock') || raw.includes('locked') || raw.includes('password')) {
-      throw new Error('Freighter is locked. Open the extension, enter your password, then try again.');
-    }
-    // Fallback — show raw error so user knows what to act on
     throw new Error(
-      access.error
-        ? `Freighter: ${access.error}`
-        : 'Freighter did not return an address. Open Freighter, unlock it, and try again.'
+      "Freighter wallet extension is not installed or could not be detected."
+    );
+  }
+  if (connected?.error || !connected?.isConnected) {
+    throw new Error(
+      "Freighter wallet extension is not installed or could not be detected."
     );
   }
 
-  // 3. Read network passphrase so we can validate it client-side
-  const netResult = await getNetworkDetails();
-  if (netResult.error) {
-    throw new Error('Could not read network from Freighter. Switch Freighter to Testnet and try again.');
+  // 2. Request access — this opens the authorization popup.
+  let access: { address: string; error?: { message: string } };
+  try {
+    access = await freighterRequestAccess();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(describeFreighterError(msg));
+  }
+  if (access?.error) {
+    throw new Error(describeFreighterError(access.error.message));
+  }
+  if (!access?.address) {
+    throw new Error("Freighter did not return a public key.");
   }
 
-  return { publicKey: access.address, network: netResult.networkPassphrase };
+  // 3. Fetch the active network (best-effort).
+  let network = "";
+  try {
+    const net = await freighterGetNetwork();
+    if (!net?.error && net?.network) {
+      network = net.network;
+    }
+  } catch {
+    // A missing network shouldn't block an otherwise successful connection.
+  }
+
+  return { publicKey: access.address, network };
 }
 
-// ── ScVal conversion helpers ──────────────────────────────────────────────────
+/**
+ * Read-only contract simulation helper.
+ *
+ * Builds a transaction that invokes `method(...args)` on `contractId`, submits
+ * it to the RPC's `simulateTransaction`, and decodes the return value to a
+ * native JS value. No signing or submission occurs, so `sourceAddress` only
+ * needs to be a real (loadable) account — it never signs anything.
+ *
+ * @throws Error when the simulation fails or returns no value.
+ */
+export async function simulateContractCall(
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourceAddress: string
+): Promise<unknown> {
+  const server = getServer();
+  const contract = new Contract(contractId);
+  const account = await server.getAccount(sourceAddress);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const result = await withRetry(() => server.simulateTransaction(tx));
+
+  if (SorobanRpc.Api.isSimulationError(result)) {
+    throw new Error(`Simulation failed for ${method}: ${result.error}`);
+  }
+
+  if (!result.result?.retval) {
+    throw new Error(`No return value from simulation of ${method}`);
+  }
+
+  return scValToNative(result.result.retval);
+}
+
+/**
+ * Build a state-changing transaction that invokes `method(...args)` on
+ * `contractId` and returns its base64 XDR, ready for the wallet to sign.
+ *
+ * Unlike a bare `TransactionBuilder` fee, `BASE_FEE` alone only covers the
+ * classic-operation inclusion fee. Every Soroban invocation also carries a
+ * resource fee (CPU instructions, ledger read/write bytes/entries) that
+ * varies per contract and per call. `server.prepareTransaction` simulates
+ * the call and pads the tx fee with that simulated resource cost — skipped,
+ * the resource fee is 0 and the ledger footprint is empty, so the tx is
+ * rejected on submission regardless of how high BASE_FEE is set. This
+ * applies to every write across all 5 contracts (registry, bot_nft, accrual,
+ * marketplace, token), including each leg of the register → mint_basic →
+ * start_accrual flow.
+ */
+export async function buildPreparedTx(
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourceAddress: string
+): Promise<string> {
+  const server = getServer();
+  const contract = new Contract(contractId);
+  const account = await server.getAccount(sourceAddress);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const prepared = await withRetry(() => server.prepareTransaction(tx));
+  return prepared.toXDR();
+}
 
 export function addressToScVal(address: string): xdr.ScVal {
-  return Address.fromString(address).toScVal();
+  return nativeToScVal(address, { type: "address" });
 }
 
-export function u64ToScVal(value: bigint | number): xdr.ScVal {
-  return nativeToScVal(BigInt(value), { type: 'u64' });
+export function u64ToScVal(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "u64" });
 }
 
 export function u32ToScVal(value: number): xdr.ScVal {
-  return nativeToScVal(value, { type: 'u32' });
+  return nativeToScVal(value, { type: "u32" });
 }
 
-export function i128ToScVal(value: bigint | number): xdr.ScVal {
-  return nativeToScVal(BigInt(value), { type: 'i128' });
+export function i128ToScVal(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "i128" });
 }
 
 export function stringToScVal(value: string): xdr.ScVal {
-  return nativeToScVal(value, { type: 'string' });
+  return nativeToScVal(value, { type: "string" });
 }
 
 export function boolToScVal(value: boolean): xdr.ScVal {
-  return nativeToScVal(value, { type: 'bool' });
-}
-
-// ── Contract call helpers ─────────────────────────────────────────────────────
-
-interface InvokeOptions {
-  contractAddress: string;
-  method: string;
-  args?: xdr.ScVal[];
-  publicKey: string;
+  return nativeToScVal(value, { type: "bool" });
 }
 
 /**
- * Simulate a read-only contract call and return the decoded result.
+ * Fetch the current ledger's close time from the RPC.
+ *
+ * Returns a Unix timestamp (seconds since epoch) representing when the most
+ * recent ledger was closed. Used to compute the client-clock offset so the
+ * interpolated accrual counter stays accurate even when the browser clock is
+ * skewed (#492).
  */
-export async function simulateContractCall<T = unknown>(
-  opts: Omit<InvokeOptions, 'publicKey'> & { publicKey?: string }
-): Promise<T> {
+export async function getLedgerCloseTime(): Promise<number> {
   const server = getServer();
-  const contract = new Contract(opts.contractAddress);
-  // Deployer exists on testnet and works as a caller for read-only simulations
-  const caller = opts.publicKey ?? 'GDQ6QUVINBCLB3ZCA5BHDBI6E7BNJGCIDWX7WPE2F7UYSGD7P5KBPM2F';
-
-  const account = await server.getAccount(caller);
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(opts.method, ...(opts.args ?? [])))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const simResult = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`Simulation failed: ${simResult.error}`);
-  }
-  if (!simResult.result) {
-    throw new Error('No result returned from simulation');
-  }
-
-  return scValToNative(simResult.result.retval) as T;
-}
-
-/**
- * Build, sign (with Freighter), submit a mutating contract call,
- * and poll until confirmed. Returns the transaction hash.
- */
-export async function invokeContractCall(opts: InvokeOptions): Promise<string> {
-  const server = getServer();
-  const contract = new Contract(opts.contractAddress);
-
-  const account = await server.getAccount(opts.publicKey);
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(opts.method, ...(opts.args ?? [])))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const simResult = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`Simulation failed: ${simResult.error}`);
-  }
-
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
-  const xdrString = preparedTx.toEnvelope().toXDR('base64');
-
-  const signResult = await signTransaction(xdrString, {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: opts.publicKey,
-  });
-
-  if (signResult.error) {
-    throw new Error(`Signing failed: ${signResult.error}`);
-  }
-
-  const signedTx = TransactionBuilder.fromXDR(
-    signResult.signedTxXdr,
-    NETWORK_PASSPHRASE
-  );
-  const sendResult = await server.sendTransaction(signedTx);
-
-  if (sendResult.status === 'ERROR') {
-    throw new Error(`Transaction failed: ${JSON.stringify(sendResult.errorResult)}`);
-  }
-
-  const hash = sendResult.hash;
-  let attempts = 0;
-  while (attempts < 30) {
-    await sleep(2000);
-    const txResult = await server.getTransaction(hash);
-    if (txResult.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-      return hash;
-    }
-    if (txResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error(`Transaction failed on-chain: ${hash}`);
-    }
-    attempts++;
-  }
-  throw new Error(`Transaction timed out: ${hash}`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// ── Utility helpers ───────────────────────────────────────────────────────────
-
-export function truncateAddress(address: string, chars = 6): string {
-  if (address.length <= chars * 2 + 3) return address;
-  return `${address.slice(0, chars)}...${address.slice(-chars)}`;
+  const ledger = await withRetry(() => server.getLatestLedger());
+  return Number(ledger.closeTime);
 }
