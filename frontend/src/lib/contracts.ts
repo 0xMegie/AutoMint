@@ -13,6 +13,7 @@ import {
   TOKEN_CONTRACT_ID,
   ACCRUAL_CONTRACT_ID,
   BASE_FEE,
+  TX_TIMEOUT,
   STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
@@ -466,7 +467,7 @@ export async function getPendingPoints(userAddress: string): Promise<bigint> {
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("pending_points", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const result = await withRetry(() => server.simulateTransaction(tx));
@@ -526,7 +527,7 @@ export async function getUserBots(userAddress: string): Promise<bigint[]> {
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_user_bots", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const result = await withRetry(() => server.simulateTransaction(tx));
@@ -560,7 +561,7 @@ export async function getBotById(
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_bot", nativeToScVal(botId, { type: "u64" })))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const result = await withRetry(() => server.simulateTransaction(tx));
@@ -592,7 +593,7 @@ export async function getUserTotalRate(userAddress: string): Promise<bigint> {
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_user_total_rate", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(30)
+    .setTimeout(TX_TIMEOUT)
     .build();
 
   const result = await withRetry(() => server.simulateTransaction(tx));
