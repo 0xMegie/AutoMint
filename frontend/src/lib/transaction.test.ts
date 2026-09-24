@@ -40,14 +40,20 @@ jest.mock("@stellar/stellar-sdk", () => ({
   Contract: jest.fn().mockImplementation(() => ({
     call: jest.fn(() => ({ op: true })),
   })),
-  TransactionBuilder: jest.fn().mockImplementation(() => ({
-    addOperation: jest.fn().mockReturnThis(),
-    setTimeout: jest.fn().mockReturnThis(),
-    build: jest.fn(() => ({
-      fee: "100",
-      toXDR: () => "tx-xdr",
+  TransactionBuilder: Object.assign(
+    jest.fn().mockImplementation(() => ({
+      addOperation: jest.fn().mockReturnThis(),
+      setTimeout: jest.fn().mockReturnThis(),
+      build: jest.fn(() => ({
+        fee: "100",
+        toXDR: () => "tx-xdr",
+      })),
     })),
-  })),
+    {
+      // Static: rehydrates the signed XDR for sendTransaction.
+      fromXDR: jest.fn(() => ({ rehydrated: true })),
+    }
+  ),
   scValToNative: jest.fn((v) => v),
   nativeToScVal: jest.fn((v) => v),
   xdr: {},
@@ -215,6 +221,7 @@ describe("sendTransaction is never retried automatically (#454)", () => {
       "tx-xdr",
       expect.objectContaining({ networkPassphrase: STELLAR_NETWORK_PASSPHRASE })
     );
-    expect(mockSendTransaction).toHaveBeenCalledWith("signed-xdr");
+    // The signed XDR is rehydrated into a Transaction before submission.
+    expect(mockSendTransaction).toHaveBeenCalledWith({ rehydrated: true });
   });
 });
