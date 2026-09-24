@@ -229,7 +229,10 @@ impl MarketplaceContract {
         if min_price <= 0 {
             return Err(MarketplaceError::InvalidPrice);
         }
-        let old: Option<i128> = env.storage().instance().get(&DataKey::MinPrice(currency.clone()));
+        let old: Option<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPrice(currency.clone()));
         env.storage()
             .instance()
             .set(&DataKey::MinPrice(currency.clone()), &min_price);
@@ -426,13 +429,12 @@ impl MarketplaceContract {
         {
             return Err(MarketplaceError::PaymentFailed);
         }
-        if fee > 0 {
-            if token_client
+        if fee > 0
+            && token_client
                 .try_transfer(&buyer, &config.admin, &fee)
                 .is_err()
-            {
-                return Err(MarketplaceError::PaymentFailed);
-            }
+        {
+            return Err(MarketplaceError::PaymentFailed);
         }
 
         listing.active = false;
@@ -662,7 +664,9 @@ impl MarketplaceContract {
         let old_fee_bps = config.fee_bps;
         config.fee_bps = new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "fee_bps_upd"),),
             (old_fee_bps, new_fee_bps),
@@ -680,7 +684,9 @@ impl MarketplaceContract {
         let old_nft = config.bot_nft.clone();
         config.bot_nft = new_bot_nft;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "bot_nft_upd"),),
             (old_nft, config.bot_nft.clone()),
@@ -698,7 +704,9 @@ impl MarketplaceContract {
         let old_admin = config.admin.clone();
         config.admin = new_admin;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "admin_upd"),),
             (old_admin, config.admin.clone()),
@@ -718,7 +726,9 @@ impl MarketplaceContract {
                 new_active.push_back(id);
             }
         }
-        env.storage().instance().set(&DataKey::ActiveListings, &new_active);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveListings, &new_active);
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);

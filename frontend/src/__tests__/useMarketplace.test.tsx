@@ -127,14 +127,14 @@ describe('useMarketplace Hooks', () => {
       const { result } = renderHook(() => useMintTierBot(), { wrapper });
 
       act(() => {
-        result.current.mutate({ tier: 'Advanced', token: 'TOKEN_ADDRESS' });
+        result.current.mutate({ tier: 'Advanced', token: mockPublicKey });
       });
 
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
       expect(mockExecuteTransaction).toHaveBeenCalledTimes(1);
       const call = mockExecuteTransaction.mock.calls[0][0];
-      expect(call.method).toBe('mint');
+      expect(call.method).toBe('mint_tier');
       expect(call.sourceAddress).toBe(mockPublicKey);
       expect(toast.success).toHaveBeenCalledWith(
         'Tier bot minted successfully!',
@@ -152,7 +152,7 @@ describe('useMarketplace Hooks', () => {
       const { result } = renderHook(() => useMintTierBot(), { wrapper });
 
       act(() => {
-        result.current.mutate({ tier: 'Premium', token: 'TOKEN_ADDRESS' });
+        result.current.mutate({ tier: 'Premium', token: mockPublicKey });
       });
 
       await waitFor(() => expect(result.current.isError).toBe(true));

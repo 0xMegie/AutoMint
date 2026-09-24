@@ -3,7 +3,7 @@ import { toast } from "sonner";
 import { getActiveListings, getUserListings } from "@/lib/contracts";
 import { executeTransaction, type TransactionStatus } from "@/lib/transaction";
 import { useWalletStore, selectPublicKey } from "@/store/walletStore";
-import { nativeToScVal } from "@stellar/stellar-sdk";
+import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import type { Tier } from "@/types";
 import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk } from "@/lib/queryKeys";
@@ -92,11 +92,11 @@ export function useMintTierBot() {
       return new Promise((resolve, reject) => {
         executeTransaction({
           contractId: BOT_NFT_CONTRACT_ID,
-          method: "mint",
+          method: "mint_tier",
           args: [
             nativeToScVal(publicKey, { type: "address" }),
-            nativeToScVal(tier, { type: "symbol" }),
-            nativeToScVal(token, { type: "string" }),
+            xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(tier)]),
+            nativeToScVal(token, { type: "address" }),
           ],
           sourceAddress: publicKey,
           onStatus: (status: TransactionStatus) => {

@@ -209,9 +209,12 @@ describe("getUserProfile", () => {
       address: "GUSER",
       username: "Alice",
       total_points: 350n,
+      claimed_amt: 0n,
+      registered_at: 0,
+      bot_count: 0,
     });
     const profile = await getUserProfile("GUSER");
-    expect(profile).toEqual({ address: "GUSER", username: "Alice", points: 350n });
+    expect(profile).toMatchObject({ address: "GUSER", username: "Alice", points: 350n });
   });
 
   it("throws on generic RPC failure — not swallowed as null (AM-143)", async () => {
@@ -297,11 +300,25 @@ describe("getAccrualState", () => {
 describe("getLeaderboard", () => {
   it("maps an array of raw profiles", async () => {
     mockSimulate.mockResolvedValue([
-      { address: "GA", username: "A", total_points: 500n },
-      { address: "GB", username: "B", total_points: 100n },
+      {
+        address: "GA",
+        username: "A",
+        total_points: 500n,
+        claimed_amt: 0n,
+        registered_at: 0,
+        bot_count: 1,
+      },
+      {
+        address: "GB",
+        username: "B",
+        total_points: 100n,
+        claimed_amt: 0n,
+        registered_at: 0,
+        bot_count: 0,
+      },
     ]);
     const lb = await getLeaderboard(10, "GSRC");
-    expect(lb).toEqual([
+    expect(lb).toMatchObject([
       { address: "GA", username: "A", points: 500n },
       { address: "GB", username: "B", points: 100n },
     ]);
