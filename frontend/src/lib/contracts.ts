@@ -17,6 +17,7 @@ import {
 } from "./constants";
 import { rpcCall, simulateContractCall } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
+import { withRetry } from "./rpcRetry";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
 /**
