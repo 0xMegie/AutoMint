@@ -49,7 +49,7 @@ export default function ListBotModal({ bot, isOpen, onClose }: ListBotModalProps
     }
 
     const parts = trimmed.split(".");
-    if (parts.length > 1 && parts[1].length > XLM_DECIMALS) {
+    if (parts.length > 1 && (parts[1]?.length ?? 0) > XLM_DECIMALS) {
       return {
         isValid: false,
         error: `Price cannot exceed ${XLM_DECIMALS} decimal places (Stellar token precision limit).`,
