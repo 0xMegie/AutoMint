@@ -1,4 +1,4 @@
-import { useWalletStore, WALLET_PERSIST_KEY, type PersistedWallet } from "../store/walletStore";
+import { useWalletStore, WALLET_PERSIST_KEY, type PersistedWallet } from "../walletStore";
 
 /** Read whatever the persist middleware last wrote to localStorage. */
 function readPersisted(): { state?: PersistedWallet; version?: number } | null {

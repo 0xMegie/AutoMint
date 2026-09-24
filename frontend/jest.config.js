@@ -8,7 +8,10 @@ const config = {
     '^@/(.*)$': '<rootDir>/src/$1',
     '\\.(css|less|scss|sass)$': '<rootDir>/__mocks__/styleMock.js',
   },
-  testMatch: ['**/__tests__/**/*.[jt]s?(x)', '**/?(*.)+(spec|test).[jt]s?(x)'],
+  // #489 — tests live only under `__tests__/`. A test beside its source is not
+  // collected (and fails lint, see .eslintrc.json), so a module can never again
+  // have two drifting copies of its suite.
+  testMatch: ['**/__tests__/**/*.test.[jt]s?(x)'],
   // Playwright e2e suites live in ./e2e and must never run inside Jest.
   // Generated bindings contain speculative WASM specs from dependencies and are
   // type-checked via `tsc` (with `// @ts-nocheck`), not Jest.

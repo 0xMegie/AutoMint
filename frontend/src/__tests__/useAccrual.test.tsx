@@ -16,9 +16,11 @@ import {
   getUserBots,
   getAccrualState,
   getAmtBalance,
+  getUserTotalRate,
 } from '@/lib/contracts';
 import { executeTransaction } from '@/lib/transaction';
 import { useWalletStore } from '@/store/walletStore';
+import { qk } from '@/lib/queryKeys';
 import { toast } from 'sonner';
 import type { UserProfile, AccrualState } from '@/types';
 
@@ -38,6 +40,7 @@ const mockGetUserProfile = getUserProfile as jest.MockedFunction<typeof getUserP
 const mockGetUserBots = getUserBots as jest.MockedFunction<typeof getUserBots>;
 const mockGetAccrualState = getAccrualState as jest.MockedFunction<typeof getAccrualState>;
 const mockGetAmtBalance = getAmtBalance as jest.MockedFunction<typeof getAmtBalance>;
+const mockGetUserTotalRate = getUserTotalRate as jest.MockedFunction<typeof getUserTotalRate>;
 const mockExecuteTransaction = executeTransaction as jest.MockedFunction<
   typeof executeTransaction
 >;
@@ -454,7 +457,7 @@ describe('useAccrual Hooks', () => {
   });
 });
 
-describe('useAnimatedPoints (#491)', () => {
+describe('useAnimatedPoints (#491, #490)', () => {
   let qc: QueryClient;
   const pk = 'GABCUSER';
 
@@ -465,6 +468,8 @@ describe('useAnimatedPoints (#491)', () => {
     (mockUseWalletStore as unknown as jest.Mock).mockImplementation((selector) =>
       selector({ publicKey: pk })
     );
+    // A single Basic bot unless a test says otherwise.
+    mockGetUserTotalRate.mockResolvedValue(1n);
   });
   afterEach(() => jest.useRealTimers());
 
@@ -480,7 +485,7 @@ describe('useAnimatedPoints (#491)', () => {
       total_claimed_points: 42n, // the sub-threshold carry, NOT a lifetime total
     });
 
-    const { result } = renderHook(() => useAnimatedPoints(1), { wrapper: wrap });
+    const { result } = renderHook(() => useAnimatedPoints(), { wrapper: wrap });
 
     // Waiting on the composite total also waits for profile (12,345) and the
     // interpolated pending (1 point at rate 1/hr over 3600s) to settle.
@@ -501,9 +506,44 @@ describe('useAnimatedPoints (#491)', () => {
       total_claimed_points: 3n,
     });
 
-    const { result } = renderHook(() => useAnimatedPoints(1), { wrapper: wrap });
+    const { result } = renderHook(() => useAnimatedPoints(), { wrapper: wrap });
 
     await waitFor(() => expect(result.current.total).toBe(1000n));
     expect(result.current.total).toBeGreaterThanOrEqual(1000n);
+  });
+
+  it('ticks at the on-chain total rate of a multi-bot account, not a default', async () => {
+    // Basic (1) + Diamond (500) = 501 pts/hr, as reported by get_user_total_rate.
+    mockGetUserTotalRate.mockResolvedValue(501n);
+    mockGetUserProfile.mockResolvedValue({ username: 'u', points: 0n });
+    mockGetAccrualState.mockResolvedValue({
+      last_claim_ts: BigInt(Math.floor(Date.now() / 1000) - 3600), // one hour ago
+      total_claimed_points: 0n,
+    });
+
+    const { result } = renderHook(() => useAnimatedPoints(), { wrapper: wrap });
+
+    await waitFor(() => expect(result.current.pending).toBe(501n));
+    expect(mockGetUserTotalRate).toHaveBeenCalledWith(pk);
+  });
+
+  it('changes the tick rate once a poll returns a new rate after the bots change', async () => {
+    mockGetUserProfile.mockResolvedValue({ username: 'u', points: 0n });
+    mockGetAccrualState.mockResolvedValue({
+      last_claim_ts: BigInt(Math.floor(Date.now() / 1000) - 3600),
+      total_claimed_points: 0n,
+    });
+
+    const { result } = renderHook(() => useAnimatedPoints(), { wrapper: wrap });
+    await waitFor(() => expect(result.current.pending).toBe(1n));
+
+    // The user buys a Gold bot. Bot-changing mutations invalidate qk.bots,
+    // under which the total rate is keyed, so it refetches the new rate.
+    mockGetUserTotalRate.mockResolvedValue(101n);
+    await act(async () => {
+      await qc.invalidateQueries({ queryKey: qk.bots(pk) });
+    });
+
+    await waitFor(() => expect(result.current.pending).toBe(101n));
   });
 });

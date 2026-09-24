@@ -17,7 +17,15 @@ import {
 } from "./constants";
 import { rpcCall, simulateContractCall } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
-import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
+import type {
+  BotNFT,
+  UserProfile,
+  BotTier,
+  MarketplaceListing,
+  AccrualState,
+  TierInfo,
+} from "@/types";
+import { TIER_ORDER } from "@/types";
 
 // Generated bindings (AM-151): every contract call below is typed against the
 // Rust signatures via the stellar CLI output in `frontend/src/lib/bindings/`.
@@ -317,6 +325,24 @@ export async function getAmtBalance(userAddress: string): Promise<bigint> {
     userAddress
   );
   return toBigInt(balance, "balance");
+}
+
+/**
+ * The AMT token's `decimals()` (#479). AMT amounts are converted with the
+ * token's own precision via `fromBaseUnits`, never an assumed scale.
+ */
+export async function getAmtDecimals(sourceAddress?: string): Promise<number> {
+  const raw = await simulateContractCall(
+    TOKEN_CONTRACT_ID,
+    "decimals",
+    [],
+    defaultSource(sourceAddress)
+  );
+  const decimals = Number(raw);
+  if (raw === null || raw === undefined || !Number.isInteger(decimals) || decimals < 0) {
+    throw new Error(`decimals returned unexpected value ${String(raw)}`);
+  }
+  return decimals;
 }
 
 /**
@@ -809,6 +835,41 @@ export async function getBotById(userAddress: string, botId: bigint): Promise<Bo
 export async function getUserTotalRate(userAddress: string): Promise<bigint> {
   const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_user_total_rate", [nativeToScVal(userAddress, { type: "address" })], userAddress);
   return toBigInt(raw, "get_user_total_rate");
+}
+
+/**
+ * Every tier's name, rate and price from the bot_nft contract (#478).
+ *
+ * The contract is the single source of truth for tier economics; the
+ * frontend keeps only presentational fields (`TIER_META`). Each tier is read
+ * with `get_tier_info`, keyed by its `BotTier` discriminant (a `u32` enum).
+ * Once bot_nft exposes `all_tiers()` (AM-072) this can become one call.
+ */
+export async function getAllTiers(sourceAddress?: string): Promise<Record<BotTier, TierInfo>> {
+  const source = defaultSource(sourceAddress);
+  const tiers = await Promise.all(
+    TIER_ORDER.map(async (tier, index): Promise<TierInfo> => {
+      const raw = await simulateContractCall(
+        BOT_NFT_CONTRACT_ID,
+        "get_tier_info",
+        [nativeToScVal(index, { type: "u32" })],
+        source
+      );
+      if (!Array.isArray(raw) || raw.length !== 3) {
+        throw new Error(
+          `get_tier_info returned unexpected shape for ${tier}; expected [name, rate, price]`
+        );
+      }
+      const [name, rate, price] = raw;
+      return {
+        tier,
+        name: String(name),
+        rate: toBigInt(rate, "rate"),
+        price: toBigInt(price, "price"),
+      };
+    })
+  );
+  return Object.fromEntries(tiers.map((info) => [info.tier, info])) as Record<BotTier, TierInfo>;
 }
 
 // -- Contract preflight (#464) ------------------------------------------------

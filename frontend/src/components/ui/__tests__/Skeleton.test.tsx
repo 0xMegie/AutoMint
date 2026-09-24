@@ -1,6 +1,6 @@
 import React from "react";
 import { render } from "@testing-library/react";
-import { Skeleton, CardSkeleton, BotCardSkeleton } from "./Skeleton";
+import { Skeleton, CardSkeleton, BotCardSkeleton } from "../Skeleton";
 import "@testing-library/jest-dom";
 
 describe("Skeleton Components", () => {

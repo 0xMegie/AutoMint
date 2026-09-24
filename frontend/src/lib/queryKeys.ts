@@ -62,6 +62,11 @@ export const qk = {
   registered: (address: string | null): QueryKey => ["registered", address],
   profile: (address: string | null): QueryKey => ["profile", address],
   bots: (address: string | null): QueryKey => ["bots", address],
+  /**
+   * Nested under `bots` because the total rate is derived from bot ownership:
+   * every mutation that invalidates `qk.bots(address)` refreshes it too (#490).
+   */
+  userTotalRate: (address: string | null): QueryKey => ["bots", address, "totalRate"],
   botDetails: (address: string | null, botId: bigint): QueryKey => [
     "botDetails",
     address,
@@ -75,6 +80,8 @@ export const qk = {
   ],
   accrualState: (address: string | null): QueryKey => ["accrualState", address],
   amtBalance: (address: string | null): QueryKey => ["amtBalance", address],
+  amtDecimals: (): QueryKey => ["amtDecimals"],
+  tiers: (): QueryKey => ["tiers"],
   dashboard: (address: string | null): QueryKey => ["dashboard", address],
   listings: (): QueryKey => ["listings"],
   myListings: (address: string | null): QueryKey => ["myListings", address],

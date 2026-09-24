@@ -1,5 +1,5 @@
-import { pollWhenVisible } from "./polling";
-import { DASHBOARD_POLL_MS } from "./queryKeys";
+import { pollWhenVisible } from "../polling";
+import { DASHBOARD_POLL_MS } from "../queryKeys";
 
 describe("pollWhenVisible (#495)", () => {
   function setHidden(value: boolean) {
