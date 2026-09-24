@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useWalletStore, selectPublicKey } from "@/store/walletStore";
-import { getBotById } from "@/lib/contracts";
+import { getBotById, getUserBotsDetailed } from "@/lib/contracts";
 import { ANONYMOUS_READ_SOURCE } from "@/lib/constants";
 import type { BotNFT } from "@/types";
 import { pollWhenVisible } from "@/lib/polling";
@@ -30,10 +30,29 @@ export function useAllBotDetails(botIds: bigint[]) {
     queryKey: qk.allBotDetails(publicKey, botIds),
     queryFn: async () => {
       if (!source || botIds.length === 0) return [];
-      const bots = await Promise.all(
-        botIds.map((id) => getBotById(source, id))
-      );
-      return bots.filter((bot): bot is BotNFT => bot !== null);
+      // One capped contract round trip covers every bot the source account
+      // owns (#483) -- a 10-bot dashboard makes one request per poll instead
+      // of ten getBotById simulations.
+      const detailed = await getUserBotsDetailed(source);
+      const byId = new Map<bigint, BotNFT>();
+      for (const bot of detailed) byId.set(bot.id, bot);
+
+      // Only ids the detailed call did not cover fall back to the per-id
+      // path: bots beyond the contract-side cap, or bots not owned by
+      // `source` (e.g. marketplace escrow held under the contract address).
+      const missing = botIds.filter((id) => !byId.has(id));
+      if (missing.length > 0) {
+        const fetched = await Promise.all(
+          missing.map((id) => getBotById(source, id).catch(() => null))
+        );
+        for (const bot of fetched) {
+          if (bot) byId.set(bot.id, bot);
+        }
+      }
+
+      return botIds
+        .map((id) => byId.get(id))
+        .filter((bot): bot is BotNFT => bot !== undefined);
     },
     enabled: !!source && botIds.length > 0,
     refetchInterval: pollWhenVisible(),

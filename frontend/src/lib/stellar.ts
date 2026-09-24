@@ -21,6 +21,7 @@ import {
   TX_TIMEOUT,
 } from "./constants";
 import { withRetry, isRetryableRpcError } from "./rpcRetry";
+import { useWalletStore } from "@/store/walletStore";
 
 /**
  * Multiplier applied to the assembled resource fee to add a safety buffer.
@@ -222,6 +223,111 @@ export async function connectFreighter(): Promise<{
   return { publicKey: access.address, network };
 }
 
+// -- Read-path caching (#482) -----------------------------------------------
+
+/**
+ * How long a fetched account stays fresh in the read cache (#482).
+ *
+ * Deliberately shorter than the dashboard poll cadence (`DASHBOARD_POLL_MS`,
+ * 30s): every polling hook in a poll round shares one `getAccount`, and a
+ * later round only reuses an entry if it fires within this window.
+ */
+export const ACCOUNT_CACHE_TTL_MS = 10_000;
+
+/** The account type `server.getAccount` resolves to. */
+type CachedAccount = Awaited<ReturnType<SorobanRpc.Server["getAccount"]>>;
+
+interface TtlEntry<T> {
+  promise: Promise<T>;
+  expiresAt: number;
+}
+
+/** Accounts memoized by address for {@link ACCOUNT_CACHE_TTL_MS} (#482). */
+const _accountCache = new Map<string, TtlEntry<CachedAccount>>();
+
+/**
+ * In-flight simulations keyed by `(contractId, method, args)` (#482).
+ * Entries exist only while a simulation is pending -- settled promises are
+ * removed, so results are never served stale and failures never stick.
+ */
+const _simulationInflight = new Map<string, Promise<unknown>>();
+
+/**
+ * Drop every cached read (#482).
+ *
+ * Cache invalidation rules:
+ *  1. **TTL** -- account entries expire {@link ACCOUNT_CACHE_TTL_MS} after
+ *     creation; an expired entry is replaced on the next read.
+ *  2. **Confirmed transactions** -- {@link submitTx} calls this when a
+ *     transaction reaches a terminal on-chain state (`SUCCESS` *or*
+ *     `FAILED`): either outcome consumes a sequence number and may change
+ *     balances / contract state that the caches would otherwise keep
+ *     serving stale.
+ *  3. **Errors** -- a rejected `getAccount` drops its own entry immediately,
+ *     so failures are never cached. Simulation promises are removed when
+ *     they settle, so only *concurrent* identical calls share one
+ *     in-flight promise.
+ */
+export function invalidateReadCaches(): void {
+  _accountCache.clear();
+  _simulationInflight.clear();
+}
+
+/**
+ * `getAccount` memoized by address with a short TTL (#482).
+ *
+ * The cached *promise* is stored, so concurrent readers (six polling hooks
+ * firing in the same tick) share a single RPC round trip even before the
+ * first one resolves: six reads make one account fetch.
+ */
+async function getAccountCached(sourceAddress: string): Promise<CachedAccount> {
+  const now = Date.now();
+  const hit = _accountCache.get(sourceAddress);
+  if (hit && hit.expiresAt > now) return hit.promise;
+
+  const promise = rpcCall((server) => server.getAccount(sourceAddress));
+  _accountCache.set(sourceAddress, {
+    promise,
+    expiresAt: now + ACCOUNT_CACHE_TTL_MS,
+  });
+  try {
+    return await promise;
+  } catch (error) {
+    // Never cache a failed fetch -- drop *our* entry (a newer one may have
+    // replaced it meanwhile) so the next read retries from scratch.
+    if (_accountCache.get(sourceAddress)?.promise === promise) {
+      _accountCache.delete(sourceAddress);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Stable cache key for a simulation: `(contractId, method, args)` (#482).
+ * Args are XDR-encoded when possible so distinct ScVals never collide;
+ * test doubles without `toXDR` fall back to JSON.
+ */
+function simulationKey(
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[]
+): string {
+  const parts = args.map((arg) => {
+    try {
+      const maybe = arg as unknown as {
+        toXDR?: () => { toString(encoding: string): string };
+      };
+      if (typeof maybe.toXDR === "function") {
+        return maybe.toXDR().toString("base64");
+      }
+    } catch {
+      // fall through to JSON
+    }
+    return JSON.stringify(arg);
+  });
+  return [contractId, method, parts.join("|")].join(" ");
+}
+
 /**
  * Read-only contract simulation helper.
  *
@@ -229,6 +335,12 @@ export async function connectFreighter(): Promise<{
  * it to the RPC's `simulateTransaction`, and decodes the return value to a
  * native JS value. No signing or submission occurs, so `sourceAddress` only
  * needs to be a real (loadable) account — it never signs anything.
+ *
+ * Two read-path caches apply (#482):
+ *  - `sourceAddress`'s account is fetched through `getAccountCached`
+ *    (short TTL), so a poll round of identical reads costs one `getAccount`.
+ *  - Concurrently identical simulations `(contractId, method, args)` share
+ *    one in-flight promise; the entry is removed as soon as it settles.
  *
  * @throws Error when the simulation fails or returns no value.
  */
@@ -238,28 +350,45 @@ export async function simulateContractCall(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<unknown> {
-  const contract = new Contract(contractId);
-  const account = await rpcCall((server) => server.getAccount(sourceAddress));
+  // Deduplicate concurrent identical simulations (#482): callers sharing a
+  // (contractId, method, args) key await the same in-flight promise.
+  const key = simulationKey(contractId, method, args);
+  const inflight = _simulationInflight.get(key);
+  if (inflight) return inflight;
 
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(method, ...args))
-    .setTimeout(TX_TIMEOUT)
-    .build();
+  const run = (async (): Promise<unknown> => {
+    const contract = new Contract(contractId);
+    const account = await getAccountCached(sourceAddress);
 
-  const result = await rpcCall((server) => server.simulateTransaction(tx));
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(TX_TIMEOUT)
+      .build();
 
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation failed for ${method}: ${result.error}`);
+    const result = await rpcCall((server) => server.simulateTransaction(tx));
+
+    if (SorobanRpc.Api.isSimulationError(result)) {
+      throw new Error(`Simulation failed for ${method}: ${result.error}`);
+    }
+
+    if (!result.result?.retval) {
+      throw new Error(`No return value from simulation of ${method}`);
+    }
+
+    return scValToNative(result.result.retval);
+  })();
+
+  _simulationInflight.set(key, run);
+  try {
+    return await run;
+  } finally {
+    // Only concurrent callers share the promise -- once it settles the entry
+    // is dropped so later reads see fresh state (and failures do not stick).
+    _simulationInflight.delete(key);
   }
-
-  if (!result.result?.retval) {
-    throw new Error(`No return value from simulation of ${method}`);
-  }
-
-  return scValToNative(result.result.retval);
 }
 
 /**
@@ -583,6 +712,10 @@ export async function submitTx(signedXdr: string): Promise<unknown> {
     }
 
     if (status === "SUCCESS") {
+      // A confirmed transaction (#482) consumed the source account's
+      // sequence number and may have changed balances / contract state:
+      // drop cached reads so the next poll sees the new world.
+      invalidateReadCaches();
       const ret = (getRes as unknown as { returnValue?: xdr.ScVal }).returnValue;
       if (ret) {
         try {
@@ -595,6 +728,9 @@ export async function submitTx(signedXdr: string): Promise<unknown> {
     }
 
     if (status === "FAILED") {
+      // FAILED is also a confirmed transaction: the sequence number was
+      // consumed, so the account cache is stale either way (#482).
+      invalidateReadCaches();
       const diag =
         (getRes as unknown as { resultXdr?: string; errorResultXdr?: string }).resultXdr ??
         (getRes as unknown as { resultXdr?: string }).resultXdr;

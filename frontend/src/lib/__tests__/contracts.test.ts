@@ -26,6 +26,7 @@ jest.mock("@stellar/stellar-sdk", () => {
 jest.mock("../stellar", () => ({
   __esModule: true,
   getServer: jest.fn(),
+  rpcCall: jest.fn(),
   simulateContractCall: jest.fn(),
 }));
 
@@ -54,6 +55,11 @@ import {
   getActiveListings,
   getUserListings,
   getUserRank,
+  getPendingPoints,
+  getUserBots,
+  getUserBotsDetailed,
+  getBotById,
+  getUserTotalRate,
   UNRANKED_SENTINEL,
 } from "../contracts";
 
@@ -472,5 +478,139 @@ describe("getUserRank", () => {
       .mockRejectedValueOnce(new Error("NotRegistered"));
 
     await expect(getUserRank("GSTRANGER", "GSRC")).resolves.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read functions routed through simulateContractCall (#481)
+//
+// These four used to build their own TransactionBuilder, check for errors
+// and decode by hand, and silently return 0n / [] / null on simulation
+// failure. Now they share the helper and let errors propagate (AM-143).
+// ---------------------------------------------------------------------------
+describe("getPendingPoints (#481)", () => {
+  it("decodes the simulated return value as bigint", async () => {
+    mockSimulate.mockResolvedValue(123n);
+    await expect(getPendingPoints("GUSER")).resolves.toBe(123n);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "pending_points",
+      expect.any(Array),
+      "GUSER"
+    );
+  });
+
+  it("propagates simulation errors instead of returning 0n", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getPendingPoints("GUSER")).rejects.toThrow("rpc down");
+  });
+});
+
+describe("getUserBots (#481)", () => {
+  it("maps the id list to bigints", async () => {
+    mockSimulate.mockResolvedValue([1n, 2n]);
+    await expect(getUserBots("GUSER")).resolves.toEqual([1n, 2n]);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_user_bots",
+      expect.any(Array),
+      "GUSER"
+    );
+  });
+
+  it("propagates simulation errors instead of returning []", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getUserBots("GUSER")).rejects.toThrow("rpc down");
+  });
+
+  it("throws when the contract returns a non-array", async () => {
+    mockSimulate.mockResolvedValue(null);
+    await expect(getUserBots("GUSER")).rejects.toThrow("expected array");
+  });
+});
+
+describe("getBotById (#481)", () => {
+  const rawBot = {
+    id: 5n,
+    name: "Bot",
+    owner: "GOWNER",
+    tier: "Gold",
+    accrual_rate: 10n,
+    minted_at: 1,
+    last_claim_timestamp: 0n,
+  };
+
+  it("parses the simulated bot record", async () => {
+    mockSimulate.mockResolvedValue(rawBot);
+    const bot = await getBotById("GUSER", 5n);
+    expect(bot).toMatchObject({ id: 5n, tier: "Gold", accrual_rate: 10n });
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_bot",
+      expect.any(Array),
+      "GUSER"
+    );
+  });
+
+  it("propagates simulation errors instead of returning null", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getBotById("GUSER", 5n)).rejects.toThrow("rpc down");
+  });
+});
+
+describe("getUserTotalRate (#481)", () => {
+  it("decodes the rate as bigint", async () => {
+    mockSimulate.mockResolvedValue(77n);
+    await expect(getUserTotalRate("GUSER")).resolves.toBe(77n);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_user_total_rate",
+      expect.any(Array),
+      "GUSER"
+    );
+  });
+
+  it("propagates simulation errors instead of returning 0n", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getUserTotalRate("GUSER")).rejects.toThrow("rpc down");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getUserBotsDetailed (#483)
+// ---------------------------------------------------------------------------
+describe("getUserBotsDetailed (#483)", () => {
+  const rawBot = {
+    id: 5n,
+    name: "Bot",
+    owner: "GOWNER",
+    tier: "Gold",
+    accrual_rate: 10n,
+    minted_at: 1,
+    last_claim_timestamp: 0n,
+  };
+
+  it("maps the single round trip of detailed records through parseBotNFT", async () => {
+    mockSimulate.mockResolvedValue([rawBot]);
+    const bots = await getUserBotsDetailed("GUSER");
+    expect(bots).toHaveLength(1);
+    expect(bots[0]).toMatchObject({ id: 5n, tier: "Gold", accrual_rate: 10n });
+    expect(mockSimulate).toHaveBeenCalledTimes(1);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_user_bots_detailed",
+      expect.any(Array),
+      "GUSER"
+    );
+  });
+
+  it("throws when the contract returns a non-array", async () => {
+    mockSimulate.mockResolvedValue(undefined);
+    await expect(getUserBotsDetailed("GUSER")).rejects.toThrow("expected array");
+  });
+
+  it("propagates simulation errors", async () => {
+    mockSimulate.mockRejectedValue(new Error("rpc down"));
+    await expect(getUserBotsDetailed("GUSER")).rejects.toThrow("rpc down");
   });
 });
