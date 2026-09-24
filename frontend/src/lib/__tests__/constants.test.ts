@@ -19,6 +19,7 @@ describe("constants.ts", () => {
   describe("Fallback Defaults (when env vars are unset)", () => {
     beforeEach(() => {
       delete process.env.NEXT_PUBLIC_SOROBAN_RPC_URL;
+      delete process.env.NEXT_PUBLIC_RPC_FAILOVER_AFTER;
       delete process.env.NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE;
       delete process.env.NEXT_PUBLIC_NETWORK;
       delete process.env.NEXT_PUBLIC_HORIZON_URL;
@@ -38,6 +39,8 @@ describe("constants.ts", () => {
     it("resolves default network URLs and passphrase", () => {
       const constants = require("../constants");
       expect(constants.SOROBAN_RPC_URL).toBe("https://soroban-testnet.stellar.org");
+      expect(constants.SOROBAN_RPC_URLS).toEqual(["https://soroban-testnet.stellar.org"]);
+      expect(constants.RPC_FAILOVER_AFTER).toBe(3);
       expect(constants.NETWORK_PASSPHRASE).toBe("Test SDF Network ; September 2015");
       expect(constants.STELLAR_NETWORK_PASSPHRASE).toBe("Test SDF Network ; September 2015");
       expect(constants.NETWORK).toBe("TESTNET");
@@ -108,6 +111,42 @@ describe("constants.ts", () => {
       expect(constants.STELLAR_NETWORK_PASSPHRASE).toBe("Custom Network Passphrase");
       expect(constants.NETWORK).toBe("MAINNET");
       expect(constants.HORIZON_URL).toBe("https://custom-horizon.example.com");
+    });
+
+    it("parses a comma-separated RPC URL list for failover (#454)", () => {
+      process.env.NEXT_PUBLIC_SOROBAN_RPC_URL =
+        "https://primary.example.com, https://backup-a.example.com ,,https://backup-b.example.com";
+
+      const constants = require("../constants");
+      expect(constants.SOROBAN_RPC_URLS).toEqual([
+        "https://primary.example.com",
+        "https://backup-a.example.com",
+        "https://backup-b.example.com",
+      ]);
+      // The legacy single-URL export always points at the primary entry.
+      expect(constants.SOROBAN_RPC_URL).toBe("https://primary.example.com");
+    });
+
+    it("falls back to the default RPC URL list when the env var is empty", () => {
+      process.env.NEXT_PUBLIC_SOROBAN_RPC_URL = " , ,";
+
+      const constants = require("../constants");
+      expect(constants.SOROBAN_RPC_URLS).toEqual(["https://soroban-testnet.stellar.org"]);
+      expect(constants.SOROBAN_RPC_URL).toBe("https://soroban-testnet.stellar.org");
+    });
+
+    it("reads the configured RPC failover threshold (#454)", () => {
+      process.env.NEXT_PUBLIC_RPC_FAILOVER_AFTER = "5";
+
+      const constants = require("../constants");
+      expect(constants.RPC_FAILOVER_AFTER).toBe(5);
+    });
+
+    it("falls back to the default failover threshold when it is invalid", () => {
+      process.env.NEXT_PUBLIC_RPC_FAILOVER_AFTER = "not-a-number";
+
+      const constants = require("../constants");
+      expect(constants.RPC_FAILOVER_AFTER).toBe(3);
     });
 
     it("resolves custom contract IDs and updates CONTRACT_ADDRESSES mapping", () => {
