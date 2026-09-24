@@ -4,9 +4,11 @@ import { getActiveListings, getUserListings } from "@/lib/contracts";
 import { executeTransaction, type TransactionStatus } from "@/lib/transaction";
 import { useWalletStore, selectPublicKey } from "@/store/walletStore";
 import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
-import type { Tier } from "@/types";
+import type { Tier, MarketplaceListing } from "@/types";
 import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk } from "@/lib/queryKeys";
+import { trackStatus, newTxId } from "@/components/ui/TxStatus";
+import type { DashboardData } from "./useAccrual";
 
 export function useBuyBot() {
   const queryClient = useQueryClient();
@@ -17,6 +19,7 @@ export function useBuyBot() {
       if (!publicKey) throw new Error("Wallet not connected");
 
       const MARKETPLACE_CONTRACT_ID = process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID || "";
+      const txId = newTxId("buy_bot");
 
       return new Promise((resolve, reject) => {
         executeTransaction({
@@ -25,6 +28,7 @@ export function useBuyBot() {
           args: [nativeToScVal(listingId, { type: "u128" })],
           sourceAddress: publicKey,
           onStatus: (status: TransactionStatus) => {
+            trackStatus(txId, "Purchase", status);
             switch (status.stage) {
               case "building":
               case "simulating":
@@ -66,15 +70,35 @@ export function useBuyBot() {
         }).catch(reject);
       });
     },
-    onSuccess: () => {
+    onMutate: async (listingId: bigint) => {
+      // Optimistic update (#462): drop the bought listing immediately.
+      await queryClient.cancelQueries({ queryKey: qk.listings() });
+      await queryClient.cancelQueries({ queryKey: qk.myListings(publicKey) });
+      const previousListings = queryClient.getQueryData(qk.listings());
+      const previousMyListings = queryClient.getQueryData(qk.myListings(publicKey));
+      const without = (old: MarketplaceListing[] | undefined) =>
+        old ? old.filter((l) => l.id !== listingId) : old;
+      queryClient.setQueryData(qk.listings(), without);
+      queryClient.setQueryData(qk.myListings(publicKey), without);
+      return { previousListings, previousMyListings };
+    },
+    onError: (
+      error: Error,
+      _variables: bigint,
+      context: { previousListings: unknown; previousMyListings: unknown } | undefined
+    ) => {
+      if (context) {
+        queryClient.setQueryData(qk.listings(), context.previousListings);
+        queryClient.setQueryData(qk.myListings(publicKey), context.previousMyListings);
+      }
+      // onStatus callback already handles error toasts
+      console.error("Bot purchase failed:", error);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: qk.listings() });
       queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["botDetails"] });
       queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
-    },
-    onError: (error: Error) => {
-      // onStatus callback already handles error toasts
-      console.error("Bot purchase failed:", error);
     },
   });
 }
@@ -185,6 +209,7 @@ export function useListBot() {
       if (!publicKey) throw new Error("Wallet not connected");
 
       const MARKETPLACE_CONTRACT_ID = process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID || "";
+      const txId = newTxId("list_bot");
 
       return new Promise((resolve, reject) => {
         executeTransaction({
@@ -196,6 +221,7 @@ export function useListBot() {
           ],
           sourceAddress: publicKey,
           onStatus: (status: TransactionStatus) => {
+            trackStatus(txId, "Listing", status);
             switch (status.stage) {
               case "building":
               case "simulating":
@@ -239,15 +265,39 @@ export function useListBot() {
         }).catch(reject);
       });
     },
-    onSuccess: () => {
+    onMutate: async ({ botId }: { botId: bigint; price: bigint }) => {
+      // Optimistic update (#462): remove the bot from the owned list.
+      await queryClient.cancelQueries({ queryKey: qk.bots(publicKey) });
+      await queryClient.cancelQueries({ queryKey: qk.dashboard(publicKey) });
+      const previousBots = queryClient.getQueryData(qk.bots(publicKey));
+      const previousDashboard = queryClient.getQueryData(qk.dashboard(publicKey));
+      queryClient.setQueryData(qk.bots(publicKey), (old: bigint[] | undefined) =>
+        old ? old.filter((id) => id !== botId) : old
+      );
+      queryClient.setQueryData(
+        qk.dashboard(publicKey),
+        (old: DashboardData | undefined) =>
+          old ? { ...old, bots: old.bots.filter((id) => id !== botId) } : old
+      );
+      return { previousBots, previousDashboard };
+    },
+    onError: (
+      error: Error,
+      _variables: { botId: bigint; price: bigint },
+      context: { previousBots: unknown; previousDashboard: unknown } | undefined
+    ) => {
+      if (context) {
+        queryClient.setQueryData(qk.bots(publicKey), context.previousBots);
+        queryClient.setQueryData(qk.dashboard(publicKey), context.previousDashboard);
+      }
+      // onStatus callback already handles error toasts
+      console.error("Bot listing failed:", error);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: qk.listings() });
       queryClient.invalidateQueries({ queryKey: qk.myListings(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["botDetails"] });
-    },
-    onError: (error: Error) => {
-      // onStatus callback already handles error toasts
-      console.error("Bot listing failed:", error);
     },
   });
 }
@@ -261,6 +311,7 @@ export function useCancelListing() {
       if (!publicKey) throw new Error("Wallet not connected");
 
       const MARKETPLACE_CONTRACT_ID = process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID || "";
+      const txId = newTxId("cancel_listing");
 
       return new Promise((resolve, reject) => {
         executeTransaction({
@@ -269,6 +320,7 @@ export function useCancelListing() {
           args: [nativeToScVal(listingId, { type: "u128" })],
           sourceAddress: publicKey,
           onStatus: (status: TransactionStatus) => {
+            trackStatus(txId, "Cancellation", status);
             switch (status.stage) {
               case "building":
               case "simulating":
@@ -312,15 +364,35 @@ export function useCancelListing() {
         }).catch(reject);
       });
     },
-    onSuccess: () => {
+    onMutate: async (listingId: bigint) => {
+      // Optimistic update (#462): drop the cancelled listing immediately.
+      await queryClient.cancelQueries({ queryKey: qk.listings() });
+      await queryClient.cancelQueries({ queryKey: qk.myListings(publicKey) });
+      const previousListings = queryClient.getQueryData(qk.listings());
+      const previousMyListings = queryClient.getQueryData(qk.myListings(publicKey));
+      const without = (old: MarketplaceListing[] | undefined) =>
+        old ? old.filter((l) => l.id !== listingId) : old;
+      queryClient.setQueryData(qk.listings(), without);
+      queryClient.setQueryData(qk.myListings(publicKey), without);
+      return { previousListings, previousMyListings };
+    },
+    onError: (
+      error: Error,
+      _variables: bigint,
+      context: { previousListings: unknown; previousMyListings: unknown } | undefined
+    ) => {
+      if (context) {
+        queryClient.setQueryData(qk.listings(), context.previousListings);
+        queryClient.setQueryData(qk.myListings(publicKey), context.previousMyListings);
+      }
+      // onStatus callback already handles error toasts
+      console.error("Listing cancellation failed:", error);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: qk.listings() });
       queryClient.invalidateQueries({ queryKey: qk.myListings(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["botDetails"] });
-    },
-    onError: (error: Error) => {
-      // onStatus callback already handles error toasts
-      console.error("Listing cancellation failed:", error);
     },
   });
 }
