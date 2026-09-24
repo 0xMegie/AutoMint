@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Menu, X, Wallet, LogOut, AlertTriangle, Loader2, Download, Copy } from "lucide-react";
@@ -20,7 +20,9 @@ export default function Header() {
   const pathname = usePathname();
   const { publicKey, isConnected, networkMismatch, isConnecting, isNotInstalled, connect, disconnect } = useWallet();
   const mobileMenuRef = useRef<HTMLDivElement>(null);
-  const [isAddressCopied, setIsAddressCopied] = useState(false);
+  // Hook must run at the top level — calling it inside the copy button's
+  // onClick was a rules-of-hooks violation that crashed on click.
+  const { isCopied, handleCopy } = useCopyToClipboard(publicKey ?? "");
 
   useFocusLock(mobileMenuRef, () => setMobileOpen(false));
 
@@ -127,9 +129,7 @@ export default function Header() {
               </span>
               <button
                 onClick={() => {
-                  useCopyToClipboard(publicKey).handleCopy();
-                  setIsAddressCopied(true);
-                  setTimeout(() => setIsAddressCopied(false), 2000);
+                  handleCopy();
                 }}
                 className="ml-2 rounded-lg p-1 text-xs text-gold hover:bg-gold/10 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 aria-label="Copy address"
@@ -137,7 +137,15 @@ export default function Header() {
               >
                 <Copy className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
-              {isAddressCopied && <span className="ml-1 text-xs text-green">Copied!</span>}
+              {isCopied && <span className="ml-1 text-xs text-green">Copied!</span>}
+              <button
+                onClick={() => disconnect()}
+                className="ml-1 rounded-lg p-1 text-xs text-muted hover:text-pink hover:bg-pink/10 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                aria-label="Disconnect wallet"
+                title="Disconnect wallet"
+              >
+                <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
             </div>
           ) : (
             <button
