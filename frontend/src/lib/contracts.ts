@@ -1,24 +1,19 @@
-import {
-  Contract,
-  SorobanRpc,
-  TransactionBuilder,
-  scValToNative,
-  nativeToScVal,
-  xdr,
-} from "@stellar/stellar-sdk";
+import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import {
   REGISTRY_CONTRACT_ID,
   BOT_NFT_CONTRACT_ID,
   MARKETPLACE_CONTRACT_ID,
   TOKEN_CONTRACT_ID,
   ACCRUAL_CONTRACT_ID,
-  BASE_FEE,
-  TX_TIMEOUT,
-  STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
-import { getServer, simulateContractCall, buildPreparedTx } from "./stellar";
-import { withRetry } from "./rpcRetry";
+import {
+  simulateContractCall,
+  buildPreparedTx,
+  addressToScVal,
+  u64ToScVal,
+  i128ToScVal,
+} from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
@@ -154,7 +149,7 @@ export function parseListing(
  * Calls token contract's balance() function.
  */
 export async function getAmtBalance(userAddress: string): Promise<bigint> {
-  const balance = await simulateContractCall(
+  const balance = await simulateContractCall<bigint>(
     TOKEN_CONTRACT_ID,
     "balance",
     [nativeToScVal(userAddress, { type: "address" })],
@@ -164,21 +159,42 @@ export async function getAmtBalance(userAddress: string): Promise<bigint> {
 }
 
 /**
+ * Build the argument list for the marketplace's
+ * `list_bot(seller: Address, bot_id: u64, price: i128, currency: Address)`.
+ *
+ * Order and ScVal types must match the Rust signature exactly — a wrong count
+ * or type fails at simulation. `seller` is the address whose authorization the
+ * contract requires, so it is the connected wallet; `currency` defaults to the
+ * configured payment token.
+ */
+export function buildListBotArgs(
+  seller: string,
+  botId: bigint,
+  price: bigint,
+  currency: string = TOKEN_CONTRACT_ID
+): xdr.ScVal[] {
+  return [
+    addressToScVal(seller),
+    u64ToScVal(botId),
+    i128ToScVal(price),
+    addressToScVal(currency),
+  ];
+}
+
+/**
  * List a bot on the marketplace.
  * Transfers bot to marketplace contract and creates listing.
  */
 export async function listBot(
   userAddress: string,
   botId: bigint,
-  price: bigint
+  price: bigint,
+  currency: string = TOKEN_CONTRACT_ID
 ): Promise<string> {
   return buildTxXdr(
     MARKETPLACE_CONTRACT_ID,
     "list_bot",
-    [
-      nativeToScVal(botId, { type: "u128" }),
-      nativeToScVal(price, { type: "u128" }),
-    ],
+    buildListBotArgs(userAddress, botId, price, currency),
     userAddress
   );
 }
@@ -207,7 +223,7 @@ export async function getLeaderboard(
   limit: number = 50,
   sourceAddress?: string
 ): Promise<UserProfile[]> {
-  const raw = await simulateContractCall(
+  const raw = await simulateContractCall<Record<string, unknown>[]>(
     REGISTRY_CONTRACT_ID,
     "get_leaderboard",
     [nativeToScVal(limit, { type: "u32" })],
@@ -220,7 +236,7 @@ export async function getLeaderboard(
       `get_leaderboard returned unexpected type ${typeof raw}; expected array`
     );
   }
-  return raw.map((entry: Record<string, unknown>) => parseUserProfile(entry));
+  return raw.map((entry) => parseUserProfile(entry));
 }
 
 /**
@@ -263,7 +279,7 @@ async function getRegistryRank(
   sourceAddress: string
 ): Promise<number | null> {
   try {
-    const raw = await simulateContractCall(
+    const raw = await simulateContractCall<number | bigint>(
       REGISTRY_CONTRACT_ID,
       "get_rank",
       [nativeToScVal(userAddress, { type: "address" })],
@@ -368,7 +384,7 @@ export async function getActiveListings(
   limit: number = 100,
   sourceAddress?: string
 ): Promise<MarketplaceListing[]> {
-  const listingsRaw = await simulateContractCall(
+  const listingsRaw = await simulateContractCall<Record<string, unknown>[]>(
     MARKETPLACE_CONTRACT_ID,
     "get_active_listings",
     [
@@ -382,7 +398,7 @@ export async function getActiveListings(
       `get_active_listings returned unexpected type ${typeof listingsRaw}; expected array`
     );
   }
-  return listingsRaw.map((listing: Record<string, unknown>) => parseListing(listing));
+  return listingsRaw.map((listing) => parseListing(listing));
 }
 
 /**
@@ -395,7 +411,7 @@ export async function getActiveListings(
 export async function getUserListings(
   userAddress: string
 ): Promise<MarketplaceListing[]> {
-  const listingsRaw = await simulateContractCall(
+  const listingsRaw = await simulateContractCall<Record<string, unknown>[]>(
     MARKETPLACE_CONTRACT_ID,
     "get_user_listings",
     [nativeToScVal(userAddress, { type: "address" })],
@@ -406,7 +422,7 @@ export async function getUserListings(
       `get_user_listings returned unexpected type ${typeof listingsRaw}; expected array`
     );
   }
-  return listingsRaw.map((listing: Record<string, unknown>) => parseListing(listing));
+  return listingsRaw.map((listing) => parseListing(listing));
 }
 
 /**
@@ -418,7 +434,7 @@ export async function getUserListings(
  * to re-register.
  */
 export async function isRegistered(userAddress: string): Promise<boolean> {
-  const result = await simulateContractCall(
+  const result = await simulateContractCall<boolean>(
     REGISTRY_CONTRACT_ID,
     "is_registered",
     [nativeToScVal(userAddress, { type: "address" })],
@@ -436,7 +452,7 @@ export async function isRegistered(userAddress: string): Promise<boolean> {
  * returned as 0.
  */
 export async function getTotalUsers(sourceAddress?: string): Promise<number> {
-  const result = await simulateContractCall(
+  const result = await simulateContractCall<number | bigint>(
     REGISTRY_CONTRACT_ID,
     "total_users",
     [],
@@ -500,14 +516,14 @@ export async function startAccrual(userAddress: string, rate: number): Promise<s
  * ID, …) propagates so React Query's `isError` path fires.
  */
 export async function getAccrualState(userAddress: string): Promise<AccrualState | null> {
-  let stateRaw: Record<string, unknown> | null;
+  let stateRaw: Record<string, unknown> | null | undefined;
   try {
-    stateRaw = (await simulateContractCall(
+    stateRaw = await simulateContractCall<Record<string, unknown> | null>(
       ACCRUAL_CONTRACT_ID,
       "get_accrual_state",
       [nativeToScVal(userAddress, { type: "address" })],
       userAddress
-    )) as Record<string, unknown> | null;
+    );
   } catch (err) {
     if (isNotFoundError(err) || isNotRegisteredError(err)) return null;
     throw err;
@@ -526,28 +542,13 @@ export async function getAccrualState(userAddress: string): Promise<AccrualState
  * Calls the accrual contract's pending_points() function.
  */
 export async function getPendingPoints(userAddress: string): Promise<bigint> {
-  const server = getServer();
-  const contract = new Contract(ACCRUAL_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("pending_points", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await withRetry(() => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching pending points: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return BigInt(0);
-  }
-
-  return toBigInt(scValToNative(result.result.retval));
+  const pending = await simulateContractCall<bigint | number>(
+    ACCRUAL_CONTRACT_ID,
+    "pending_points",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  return toBigInt(pending);
 }
 
 /**
@@ -610,14 +611,14 @@ function isNotFoundError(err: unknown): boolean {
  * path fires and the UI can show a retry button.
  */
 export async function getUserProfile(userAddress: string): Promise<UserProfile | null> {
-  let profileRaw: Record<string, unknown> | null;
+  let profileRaw: Record<string, unknown> | null | undefined;
   try {
-    profileRaw = (await simulateContractCall(
+    profileRaw = await simulateContractCall<Record<string, unknown> | null>(
       REGISTRY_CONTRACT_ID,
       "get_user",
       [nativeToScVal(userAddress, { type: "address" })],
       userAddress
-    )) as Record<string, unknown> | null;
+    );
   } catch (err) {
     if (isNotRegisteredError(err)) return null;
     throw err;
@@ -631,28 +632,12 @@ export async function getUserProfile(userAddress: string): Promise<UserProfile |
  * Get the list of bot IDs owned by a user from the bot_nft contract.
  */
 export async function getUserBots(userAddress: string): Promise<bigint[]> {
-  const server = getServer();
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_user_bots", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await withRetry(() => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching user bots: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return [];
-  }
-
-  const raw = scValToNative(result.result.retval);
+  const raw = await simulateContractCall<unknown[]>(
+    BOT_NFT_CONTRACT_ID,
+    "get_user_bots",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
   if (!Array.isArray(raw)) return [];
 
   return raw.map((id) => toBigInt(id));
@@ -665,31 +650,15 @@ export async function getBotById(
   userAddress: string,
   botId: bigint
 ): Promise<BotNFT | null> {
-  const server = getServer();
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_bot", nativeToScVal(botId, { type: "u64" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await withRetry(() => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching bot #${botId.toString()}: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return null;
-  }
-
-  const raw = scValToNative(result.result.retval);
+  const raw = await simulateContractCall<Record<string, unknown> | null>(
+    BOT_NFT_CONTRACT_ID,
+    "get_bot",
+    [nativeToScVal(botId, { type: "u64" })],
+    userAddress
+  );
   if (!raw) return null;
 
-  return parseBotNFT(raw as Record<string, unknown>);
+  return parseBotNFT(raw);
 }
 
 /**
@@ -697,26 +666,11 @@ export async function getBotById(
  * bot_nft contract.
  */
 export async function getUserTotalRate(userAddress: string): Promise<bigint> {
-  const server = getServer();
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_user_total_rate", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await withRetry(() => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching user total rate: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return BigInt(0);
-  }
-
-  return toBigInt(scValToNative(result.result.retval));
+  const rate = await simulateContractCall<bigint | number>(
+    BOT_NFT_CONTRACT_ID,
+    "get_user_total_rate",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  return toBigInt(rate);
 }

@@ -4,8 +4,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { Toaster } from "sonner";
 import { retryQuery, retryMutation } from "@/lib/retry";
+import { useResumePendingTransactions } from "@/hooks/useResumePendingTransactions";
 
 export default function Providers({ children }: { children: React.ReactNode }) {
+  // A transaction left confirming when the tab closed is settled on next load.
+  useResumePendingTransactions();
+
   const [queryClient] = useState(
     () =>
       new QueryClient({
