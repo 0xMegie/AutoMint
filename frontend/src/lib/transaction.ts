@@ -36,9 +36,9 @@ export type TransactionStage =
  */
 export interface TransactionStatus {
   stage: TransactionStage;
-  hash?: string;
-  explorerUrl?: string;
-  error?: string;
+  hash?: string | undefined;
+  explorerUrl?: string | undefined;
+  error?: string | undefined;
 }
 
 /**
@@ -105,10 +105,10 @@ function reconcileSequence(address: string, confirmedSequence: number): void {
  * Refreshes the account sequence number and re-attempts once.
  */
 async function retryOnBadSeq(
-  fn: () => Promise<SorobanRpc.SendTransactionResponse>,
+  fn: () => Promise<SorobanRpc.Api.SendTransactionResponse>,
   address: string,
   onStatus: (status: TransactionStatus) => void
-): Promise<SorobanRpc.SendTransactionResponse> {
+): Promise<SorobanRpc.Api.SendTransactionResponse> {
   try {
     return await fn();
   } catch (err) {
@@ -152,7 +152,8 @@ async function queueTransaction<T>(
   }
 
   const queue = transactionQueues.get(address)!;
-  const promise = queue.length === 0 ? Promise.resolve() : queue[queue.length - 1];
+  const promise: Promise<unknown> =
+    queue[queue.length - 1] ?? Promise.resolve();
 
   const result = promise.then(() => fn()).catch((err) => {
     // Keep queue moving even on error
@@ -285,7 +286,12 @@ export async function executeTransaction({
     onStatus({ stage: "submitting" });
     const submitResult = await queueTransaction(sourceAddress, () =>
       retryOnBadSeq(
-        () => getServer().sendTransaction(signedXdr),
+        // sendTransaction takes a Transaction object in this SDK — rehydrate
+        // the signed XDR before handing it over.
+        () =>
+          getServer().sendTransaction(
+            TransactionBuilder.fromXDR(signedXdr, STELLAR_NETWORK_PASSPHRASE)
+          ),
         sourceAddress,
         onStatus
       )
@@ -294,7 +300,11 @@ export async function executeTransaction({
     txHash = submitResult.hash;
 
     if (submitResult.status === "ERROR") {
-      throw new Error(`Transaction submission failed: ${submitResult.errorResultXdr}`);
+      // errorResult is a parsed xdr.TransactionResult — the raw XDR field
+      // (errorResultXdr) only exists on the unparsed response shape.
+      throw new Error(
+        "Transaction submission failed — the network rejected the transaction."
+      );
     }
 
     // 6. Poll for confirmation
@@ -410,8 +420,28 @@ async function signTransaction(
 interface PollResult {
   status: "SUCCESS" | "FAILED" | "TIMEOUT";
   returnValue?: unknown;
-  sequenceNumber?: number;
-  error?: string;
+  sequenceNumber?: number | undefined;
+  error?: string | undefined;
+}
+
+/**
+ * Extract the account sequence number from a confirmed transaction's
+ * envelope so the local tracker can be reconciled after success.
+ */
+function sequenceFromEnvelope(
+  envelope: xdr.TransactionEnvelope
+): number | undefined {
+  try {
+    if (envelope.switch() === xdr.EnvelopeType.envelopeTypeTx()) {
+      return Number(envelope.v1().tx().seqNum());
+    }
+    if (envelope.switch() === xdr.EnvelopeType.envelopeTypeTxFeeBump()) {
+      return Number(envelope.feeBump().tx().innerTx().v1().tx().seqNum());
+    }
+  } catch {
+    // Malformed/unexpected envelope — leave the tracker untouched.
+  }
+  return undefined;
 }
 
 async function pollTransaction(
@@ -442,16 +472,16 @@ async function pollTransaction(
         return {
           status: "SUCCESS",
           returnValue,
-          sequenceNumber: result.sequenceNumber
-            ? parseInt(result.sequenceNumber, 10)
-            : undefined,
+          sequenceNumber: sequenceFromEnvelope(result.envelopeXdr),
         };
       }
 
       if (result.status === "FAILED") {
         return {
           status: "FAILED",
-          error: result.resultXdr || "Contract execution failed",
+          // resultXdr is a parsed xdr.TransactionResult object — a generic
+          // message beats stringifying it to "[object Object]".
+          error: "Contract execution failed",
         };
       }
 
