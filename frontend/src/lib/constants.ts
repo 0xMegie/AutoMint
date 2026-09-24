@@ -28,7 +28,8 @@ export const SOROBAN_RPC_URLS: string[] =
   parsedRpcUrls.length > 0 ? parsedRpcUrls : [DEFAULT_SOROBAN_RPC_URL];
 
 /** Primary Soroban RPC endpoint — the first entry of {@link SOROBAN_RPC_URLS}. */
-export const SOROBAN_RPC_URL = SOROBAN_RPC_URLS[0];
+export const SOROBAN_RPC_URL: string =
+  SOROBAN_RPC_URLS[0] ?? DEFAULT_SOROBAN_RPC_URL;
 
 /**
  * Number of consecutive retryable failures against the active endpoint
