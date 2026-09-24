@@ -17,8 +17,7 @@ import {
   STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
-import { getServer, simulateContractCall, buildPreparedTx } from "./stellar";
-import { withRetry } from "./rpcRetry";
+import { rpcCall, simulateContractCall, buildPreparedTx } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
@@ -526,18 +525,17 @@ export async function getAccrualState(userAddress: string): Promise<AccrualState
  * Calls the accrual contract's pending_points() function.
  */
 export async function getPendingPoints(userAddress: string): Promise<bigint> {
-  const server = getServer();
   const contract = new Contract(ACCRUAL_CONTRACT_ID);
 
   const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
+    await rpcCall((server) => server.getAccount(userAddress)),
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("pending_points", nativeToScVal(userAddress, { type: "address" })))
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const result = await withRetry(() => server.simulateTransaction(tx));
+  const result = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`Simulation error fetching pending points: ${result.error}`);
@@ -631,18 +629,17 @@ export async function getUserProfile(userAddress: string): Promise<UserProfile |
  * Get the list of bot IDs owned by a user from the bot_nft contract.
  */
 export async function getUserBots(userAddress: string): Promise<bigint[]> {
-  const server = getServer();
   const contract = new Contract(BOT_NFT_CONTRACT_ID);
 
   const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
+    await rpcCall((server) => server.getAccount(userAddress)),
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_user_bots", nativeToScVal(userAddress, { type: "address" })))
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const result = await withRetry(() => server.simulateTransaction(tx));
+  const result = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`Simulation error fetching user bots: ${result.error}`);
@@ -665,18 +662,17 @@ export async function getBotById(
   userAddress: string,
   botId: bigint
 ): Promise<BotNFT | null> {
-  const server = getServer();
   const contract = new Contract(BOT_NFT_CONTRACT_ID);
 
   const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
+    await rpcCall((server) => server.getAccount(userAddress)),
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_bot", nativeToScVal(botId, { type: "u64" })))
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const result = await withRetry(() => server.simulateTransaction(tx));
+  const result = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`Simulation error fetching bot #${botId.toString()}: ${result.error}`);
@@ -697,18 +693,17 @@ export async function getBotById(
  * bot_nft contract.
  */
 export async function getUserTotalRate(userAddress: string): Promise<bigint> {
-  const server = getServer();
   const contract = new Contract(BOT_NFT_CONTRACT_ID);
 
   const tx = new TransactionBuilder(
-    await server.getAccount(userAddress),
+    await rpcCall((server) => server.getAccount(userAddress)),
     { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
   )
     .addOperation(contract.call("get_user_total_rate", nativeToScVal(userAddress, { type: "address" })))
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const result = await withRetry(() => server.simulateTransaction(tx));
+  const result = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`Simulation error fetching user total rate: ${result.error}`);
