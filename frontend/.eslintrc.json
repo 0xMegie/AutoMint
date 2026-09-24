@@ -18,5 +18,20 @@
     ],
     "prefer-const": "error",
     "eqeqeq": ["error", "always", { "null": "ignore" }]
-  }
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.{js,jsx,ts,tsx}", "**/*.spec.{js,jsx,ts,tsx}"],
+      "excludedFiles": ["**/__tests__/**", "e2e/**"],
+      "rules": {
+        "no-restricted-syntax": [
+          "error",
+          {
+            "selector": "Program",
+            "message": "Test files belong in a __tests__/ directory; jest.config.js only collects tests from there (#489)."
+          }
+        ]
+      }
+    }
+  ]
 }

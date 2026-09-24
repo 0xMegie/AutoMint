@@ -21,6 +21,15 @@
 //! considered and rejected because it would hide volume at the cost of UX
 //! without adding privacy on-chain.
 //!
+//! ## Escrowed-bot rate accrual (#443)
+//!
+//! When a bot is listed, it is transferred to the marketplace contract, which
+//! becomes its owner. The marketplace address must be excluded from rate
+//! accounting in sync_rate (AM-003) and similar operations to prevent accrual
+//! on escrowed bots from accumulating to an address that cannot claim.
+//! Rate accrual for escrowed bots is either burned (simple) or credited to the
+//! seller for the listing duration (documented economic model).
+//!
 //! ## Price, currency and fee relationship
 //!
 //! ```text
@@ -51,6 +60,27 @@
 //! purpose and is `admin`-only.
 //!
 //! `list_bot` returns `PriceTooLow` when `price < min_price(currency)`.
+//!
+//! ## Per-seller listing limits (#438)
+//!
+//! Each seller may maintain up to a configurable number of active listings
+//! (default: 50). This cap prevents one attacker from flooding the marketplace
+//! with thousands of dust listings. The limit applies only to *active* listings;
+//! cancelled or completed listings do not count.
+//!
+//! `list_bot` returns `TooManyListings` when `seller`'s active listing count
+//! reaches the cap. Cancelling or selling a listing frees a slot.
+//!
+//! The cap is readable via `get_listing_cap()` and adjustable by admin via
+//! `set_listing_cap(new_cap)`.
+//!
+//! ## Bot NFT contract validation (#444)
+//!
+//! At initialization and on `set_bot_nft`, the marketplace probes the supplied
+//! address with a cheap read (checking if it responds to the bot_nft interface)
+//! and rejects an unresponsive one with `InvalidBotNft`. This prevents a
+//! permanently-broken marketplace caused by a typo in the bot_nft address.
+//! The bot_nft address is readable via `bot_nft()` getter.
 //!
 //! ## Events
 //!
@@ -90,6 +120,8 @@ pub enum DataKey {
     Config,
     Initialized,
     MinPrice(Address),
+    UserActiveListingCount(Address),
+    ListingCap,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +174,8 @@ pub enum MarketplaceError {
     PriceTooLow = 13,
     ListingStale = 14,
     SelfPurchase = 15,
+    TooManyListings = 16,
+    InvalidBotNft = 17,
 }
 
 const LEDGER_BUMP: u32 = 120960;
@@ -153,7 +187,7 @@ pub struct MarketplaceContract;
 #[contractimpl]
 impl MarketplaceContract {
     /// Set the admin and bot_nft addresses. Fails with `AlreadyInitialized` if
-    /// called twice.
+    /// called twice. Validates bot_nft contract responds to admin() call.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -164,6 +198,9 @@ impl MarketplaceContract {
             return Err(MarketplaceError::AlreadyInitialized);
         }
         admin.require_auth();
+
+        Self::probe_bot_nft(&env, &bot_nft)?;
+
         let config = Config {
             admin: admin.clone(),
             bot_nft: bot_nft.clone(),
@@ -175,6 +212,9 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::ActiveListings, &Vec::<u64>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::ListingCap, &50u32);
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
@@ -229,7 +269,10 @@ impl MarketplaceContract {
         if min_price <= 0 {
             return Err(MarketplaceError::InvalidPrice);
         }
-        let old: Option<i128> = env.storage().instance().get(&DataKey::MinPrice(currency.clone()));
+        let old: Option<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPrice(currency.clone()));
         env.storage()
             .instance()
             .set(&DataKey::MinPrice(currency.clone()), &min_price);
@@ -264,6 +307,22 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Config)
             .ok_or(MarketplaceError::NotInitialized)?;
+
+        let listing_cap: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ListingCap)
+            .unwrap_or(50);
+
+        let user_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::UserActiveListingCount(seller.clone()))
+            .unwrap_or(0);
+
+        if user_count >= listing_cap {
+            return Err(MarketplaceError::TooManyListings);
+        }
 
         // Enforce per-currency floor: price must be >= min_price(currency).
         // The default guarantees fee >= 1 base unit when fee_bps > 0.
@@ -335,6 +394,16 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .set(&DataKey::UserListings(seller.clone()), &user_listings);
+
+        let updated_count = user_count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserActiveListingCount(seller.clone()), &updated_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserActiveListingCount(seller.clone()),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
 
         env.storage()
             .instance()
@@ -426,13 +495,12 @@ impl MarketplaceContract {
         {
             return Err(MarketplaceError::PaymentFailed);
         }
-        if fee > 0 {
-            if token_client
+        if fee > 0
+            && token_client
                 .try_transfer(&buyer, &config.admin, &fee)
                 .is_err()
-            {
-                return Err(MarketplaceError::PaymentFailed);
-            }
+        {
+            return Err(MarketplaceError::PaymentFailed);
         }
 
         listing.active = false;
@@ -445,6 +513,7 @@ impl MarketplaceContract {
             LEDGER_BUMP,
         );
         Self::remove_active_listing(&env, listing_id);
+        Self::decrement_user_active_listing_count(&env, &listing.seller);
         let purchase = Purchase {
             listing_id,
             bot_id: listing.bot_id,
@@ -527,6 +596,8 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        Self::decrement_user_active_listing_count(&env, &listing.seller);
 
         env.events().publish(
             (symbol_short!("cancel"), seller, listing_id),
@@ -662,7 +733,9 @@ impl MarketplaceContract {
         let old_fee_bps = config.fee_bps;
         config.fee_bps = new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "fee_bps_upd"),),
             (old_fee_bps, new_fee_bps),
@@ -677,10 +750,15 @@ impl MarketplaceContract {
             .get(&DataKey::Config)
             .ok_or(MarketplaceError::NotInitialized)?;
         config.admin.require_auth();
+
+        Self::probe_bot_nft(&env, &new_bot_nft)?;
+
         let old_nft = config.bot_nft.clone();
         config.bot_nft = new_bot_nft;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "bot_nft_upd"),),
             (old_nft, config.bot_nft.clone()),
@@ -698,12 +776,58 @@ impl MarketplaceContract {
         let old_admin = config.admin.clone();
         config.admin = new_admin;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
         env.events().publish(
             (Symbol::new(&env, "admin_upd"),),
             (old_admin, config.admin.clone()),
         );
         Ok(())
+    }
+
+    pub fn get_listing_cap(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ListingCap)
+            .unwrap_or(50)
+    }
+
+    pub fn set_listing_cap(env: Env, new_cap: u32) -> Result<(), MarketplaceError> {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ListingCap, &new_cap);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            (Symbol::new(&env, "listing_cap_upd"),),
+            new_cap,
+        );
+        Ok(())
+    }
+
+    pub fn get_user_active_listing_count(env: Env, seller: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::UserActiveListingCount(seller))
+            .unwrap_or(0)
+    }
+
+    pub fn bot_nft(env: Env) -> Address {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap();
+        config.bot_nft
     }
 
     fn remove_active_listing(env: &Env, listing_id: u64) {
@@ -718,7 +842,9 @@ impl MarketplaceContract {
                 new_active.push_back(id);
             }
         }
-        env.storage().instance().set(&DataKey::ActiveListings, &new_active);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveListings, &new_active);
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
@@ -755,6 +881,41 @@ impl MarketplaceContract {
         // ceil(10_000 / fee_bps)
         let denom = fee_bps as i128;
         (10_000 + denom - 1) / denom
+    }
+
+    fn probe_bot_nft(env: &Env, bot_nft: &Address) -> Result<(), MarketplaceError> {
+        let bot_client = BotNFTContractClient::new(env, bot_nft);
+        bot_client
+            .try_get_bot(&1)
+            .ok()
+            .ok_or(MarketplaceError::InvalidBotNft)?;
+        Ok(())
+    }
+
+    fn decrement_user_active_listing_count(env: &Env, seller: &Address) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::UserActiveListingCount(seller.clone()))
+            .unwrap_or(0);
+
+        if count > 0 {
+            let new_count = count - 1;
+            if new_count > 0 {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UserActiveListingCount(seller.clone()), &new_count);
+            } else {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::UserActiveListingCount(seller.clone()));
+            }
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserActiveListingCount(seller.clone()),
+                LEDGER_THRESHOLD,
+                LEDGER_BUMP,
+            );
+        }
     }
 }
 

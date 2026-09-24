@@ -20,18 +20,20 @@ jest.mock("../constants", () => {
   };
 });
 
-// Keep the real ScVal helpers; only the network-touching builder is replaced.
+const mockServer = {
+  getAccount: jest.fn(),
+  simulateTransaction: jest.fn(),
+};
+
+// Keep the real ScVal helpers; only the RPC round trips are replaced.
 jest.mock("../stellar", () => ({
   ...jest.requireActual("../stellar"),
-  buildPreparedTx: jest.fn(),
+  rpcCall: (fn: (server: unknown) => unknown) => fn(mockServer),
 }));
 
-import { Contract, Keypair, StrKey, scValToNative } from "@stellar/stellar-sdk";
-import { buildPreparedTx } from "../stellar";
+import { Account, Contract, Keypair, StrKey, scValToNative } from "@stellar/stellar-sdk";
 import { buildListBotArgs, listBot } from "../contracts";
 import { MARKETPLACE_CONTRACT_ID, TOKEN_CONTRACT_ID } from "../constants";
-
-const mockBuildPreparedTx = buildPreparedTx as jest.Mock;
 
 const SELLER = Keypair.random().publicKey();
 const OTHER_CURRENCY = StrKey.encodeContract(Buffer.alloc(32, 9));
@@ -81,21 +83,40 @@ describe("buildListBotArgs", () => {
 
 describe("listBot", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    mockBuildPreparedTx.mockResolvedValue("PREPARED_XDR");
+    jest.resetAllMocks();
+    mockServer.getAccount.mockResolvedValue(new Account(SELLER, "1"));
+    // Stop at simulation: the transaction handed to it is what is under test.
+    mockServer.simulateTransaction.mockResolvedValue({ error: "stopped before assembly" });
   });
 
-  it("builds list_bot against the marketplace with the seller as the source account", async () => {
-    const result = await listBot(SELLER, 7n, 100n);
+  it("simulates a list_bot call against the marketplace, sourced from the seller", async () => {
+    await expect(listBot(SELLER, 7n, 100n)).rejects.toThrow(
+      "Simulation failed for list_bot: stopped before assembly"
+    );
 
-    expect(result).toBe("PREPARED_XDR");
-    expect(mockBuildPreparedTx).toHaveBeenCalledTimes(1);
+    expect(mockServer.getAccount).toHaveBeenCalledWith(SELLER);
 
-    const [contractId, method, args, source] = mockBuildPreparedTx.mock.calls[0];
-    expect(contractId).toBe(MARKETPLACE_CONTRACT_ID);
-    expect(method).toBe("list_bot");
-    expect(source).toBe(SELLER);
-    expect(args).toHaveLength(4);
+    const built = mockServer.simulateTransaction.mock.calls[0][0];
+    expect(built.source).toBe(SELLER);
+
+    const invocation = built
+      .toEnvelope()
+      .v1()
+      .tx()
+      .operations()[0]
+      .body()
+      .invokeHostFunctionOp()
+      .hostFunction()
+      .invokeContract();
+    expect(invocation.functionName().toString()).toBe("list_bot");
+
+    const args = invocation.args();
+    expect(args.map((arg: { switch(): { name: string } }) => arg.switch().name)).toEqual([
+      "scvAddress",
+      "scvU64",
+      "scvI128",
+      "scvAddress",
+    ]);
     expect(scValToNative(args[0])).toBe(SELLER);
     expect(scValToNative(args[3])).toBe(TOKEN_CONTRACT_ID);
   });

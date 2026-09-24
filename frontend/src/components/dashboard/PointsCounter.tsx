@@ -6,6 +6,7 @@ import { Zap } from "lucide-react";
 import clsx from "clsx";
 import type { BotNFT } from "@/types";
 import { TIER_META, BOT_TIER_COLORS, BOT_TIER_BG_COLORS } from "@/types";
+import { fromBaseUnits } from "@/lib/format";
 
 export interface BotRateBreakdown {
   bot: BotNFT;
@@ -18,8 +19,10 @@ export interface PointsCounterProps {
   rate: number;
   /** Optional per-bot breakdown for the rate detail rows */
   bots?: BotNFT[];
-  /** Optional AMT token balance */
+  /** Optional AMT token balance, in the token's base units */
   amtBalance?: bigint;
+  /** The AMT token's `decimals()`; the balance row renders once it is known */
+  amtDecimals?: number | undefined;
 }
 
 /**
@@ -49,7 +52,13 @@ function useAnimatedNumber(target: number, duration = 0.8) {
   return displayed;
 }
 
-function PointsCounterComponent({ points, rate, bots, amtBalance }: PointsCounterProps) {
+function PointsCounterComponent({
+  points,
+  rate,
+  bots,
+  amtBalance,
+  amtDecimals,
+}: PointsCounterProps) {
   const animatedPoints = useAnimatedNumber(points);
 
   return (
@@ -80,11 +89,11 @@ function PointsCounterComponent({ points, rate, bots, amtBalance }: PointsCounte
         </p>
 
         {/* AMT balance row */}
-        {amtBalance !== undefined && (
+        {amtBalance !== undefined && amtDecimals !== undefined && (
           <p className="mt-1 text-xs text-muted">
             ≈{" "}
             <span className="text-gold font-semibold">
-              {(Number(amtBalance) / 1_000_000).toLocaleString("en-US", {
+              {fromBaseUnits(amtBalance, amtDecimals).toLocaleString("en-US", {
                 maximumFractionDigits: 2,
               })}
             </span>{" "}

@@ -294,7 +294,10 @@ describe("Marketplace Page Integration (#499)", () => {
 
     render(<MarketplacePage />);
 
+    // Buy opens a confirmation dialog; confirming is what fires the mutation.
     fireEvent.click(screen.getByTestId("buy-btn-10"));
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
+
     expect(mockMarketplace.buyMutate).toHaveBeenCalledWith(10n, expect.any(Object));
   });
 
@@ -326,7 +329,9 @@ describe("Marketplace Page Integration (#499)", () => {
 
     // Active listing by the user renders with a cancel button.
     expect(screen.getByTestId("marketplace-mine-grid")).toBeInTheDocument();
+    // Cancel also goes through a confirmation dialog first.
     fireEvent.click(screen.getByTestId("cancel-btn-20"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(mockMarketplace.cancelMutate).toHaveBeenCalledWith(20n, expect.any(Object));
   });
 

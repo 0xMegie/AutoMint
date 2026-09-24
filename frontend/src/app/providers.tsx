@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Toaster } from "sonner";
 import { retryQuery, retryMutation } from "@/lib/retry";
 import { useResumePendingTransactions } from "@/hooks/useResumePendingTransactions";
+import { TxStatusList } from "@/components/ui/TxStatus";
 
 export default function Providers({ children }: { children: React.ReactNode }) {
   // A transaction left confirming when the tab closed is settled on next load.
@@ -39,6 +40,9 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       {children}
+      {/* Persistent per-transaction status rows (#461) — one row per tx id,
+          bottom-left so it never collides with the sonner toaster. */}
+      <TxStatusList />
       <Toaster
         position="bottom-right"
         richColors

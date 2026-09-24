@@ -115,6 +115,11 @@ const LEDGER_THRESHOLD: u32 = 103680;
 const MAX_TIER_SUPPLY: u64 = 50;
 /// Maximum number of recipients in a single admin_mint_batch call.
 const MAX_BATCH_SIZE: u64 = 50;
+/// Maximum number of bots returned by a single `get_user_bots_detailed` call.
+/// The cap is enforced contract-side so one simulation stays within the
+/// compute budget; callers with more bots paginate via `get_user_bots` +
+/// `get_bot` (#483).
+const MAX_DETAILED_BOTS: usize = 50;
 
 #[contract]
 pub struct BotNFTContract;
@@ -359,6 +364,22 @@ impl BotNFTContract {
             .persistent()
             .get::<_, Vec<u64>>(&DataKey::UserBots(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Full `BotNFT` records for up to the first `MAX_DETAILED_BOTS` bots
+    /// owned by `user`, in ownership order. Replaces the N+1 fan-out of
+    /// `get_user_bots` + `get_bot` with a single simulation; the cap is
+    /// enforced here, contract-side, and callers paginate past it with the
+    /// ID-based getters (#483).
+    pub fn get_user_bots_detailed(env: Env, user: Address) -> Vec<BotNFT> {
+        let ids = Self::get_user_bots(env.clone(), user);
+        let mut bots = Vec::new(&env);
+        for id in ids.iter().take(MAX_DETAILED_BOTS) {
+            if let Ok(bot) = Self::get_bot(env.clone(), id) {
+                bots.push_back(bot);
+            }
+        }
+        bots
     }
 
     pub fn get_user_total_rate(env: Env, user: Address) -> u64 {
@@ -705,6 +726,54 @@ mod test {
         assert_eq!(bots.get(0), Some(id1));
         assert_eq!(bots.get(1), Some(id2));
         assert_eq!(bots.get(2), Some(id3));
+    }
+
+    // #483: bulk detail read used by the dashboard instead of an N+1 fan-out.
+    #[test]
+    fn test_get_user_bots_detailed_returns_full_records() {
+        let (env, _admin, registry, _token, client) = setup();
+        let user = Address::generate(&env);
+        register_user(&env, &registry, &user, "user1");
+        let id1 = client.mint_basic(&user);
+        let id2 = client.mint_basic(&user);
+
+        let detailed = client.get_user_bots_detailed(&user);
+        assert_eq!(detailed.len(), 2);
+        assert_eq!(detailed.get(0).map(|bot| bot.id), Some(id1));
+        assert_eq!(detailed.get(1).map(|bot| bot.id), Some(id2));
+        assert_eq!(
+            detailed.get(0).map(|bot| bot.owner.clone()),
+            Some(user.clone())
+        );
+    }
+
+    #[test]
+    fn test_get_user_bots_detailed_empty_for_user_with_no_bots() {
+        let (env, _admin, _registry, _token, client) = setup();
+        let user = Address::generate(&env);
+        assert_eq!(client.get_user_bots_detailed(&user).len(), 0);
+    }
+
+    // #483: the result is capped contract-side at MAX_DETAILED_BOTS even
+    // when the owner has more bots than the cap.
+    #[test]
+    fn test_get_user_bots_detailed_caps_at_max() {
+        let (env, _admin, _registry, _token, client) = setup();
+        let user = Address::generate(&env);
+        // 50 Basic (the per-tier supply cap) plus 1 Bronze = 51 owned bots.
+        for _ in 0..MAX_DETAILED_BOTS {
+            client.admin_mint(&user, &BotTier::Basic);
+        }
+        client.admin_mint(&user, &BotTier::Bronze);
+
+        assert_eq!(
+            client.get_user_bots(&user).len(),
+            MAX_DETAILED_BOTS as u32 + 1
+        );
+        assert_eq!(
+            client.get_user_bots_detailed(&user).len(),
+            MAX_DETAILED_BOTS as u32
+        );
     }
 
     #[test]

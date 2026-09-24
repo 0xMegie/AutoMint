@@ -11,6 +11,7 @@
 
 import React from "react";
 import { render, screen, act } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   useWalletStore,
   selectPublicKey,
@@ -33,6 +34,14 @@ jest.mock("sonner", () => ({
     warning: jest.fn(),
   },
 }));
+
+/** useWallet reads a QueryClient, so any component using it needs a provider. */
+function withQueryClient(ui: React.ReactElement) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return <QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>;
+}
 
 const INITIAL = {
   status: "disconnected" as const,
@@ -110,7 +119,7 @@ describe("useWallet subscription surface", () => {
       return <span data-testid="header-pk">{publicKey ?? "none"}</span>;
     }
 
-    render(<HeaderLike />);
+    render(withQueryClient(<HeaderLike />));
     const before = renders.mock.calls.length;
 
     act(() => {
@@ -129,7 +138,7 @@ describe("useWallet subscription surface", () => {
       return <span data-testid="mismatch">{String(networkMismatch)}</span>;
     }
 
-    render(<HeaderLike />);
+    render(withQueryClient(<HeaderLike />));
     const before = renders.mock.calls.length;
 
     act(() => {

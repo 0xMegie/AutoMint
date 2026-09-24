@@ -1,17 +1,18 @@
 /**
  * The transaction pipeline, end to end, against a mocked RPC (#467).
  *
- * The real pieces run: `useListBot` -> `executeTransaction` -> the real
- * stellar-sdk building a real `list_bot` invocation, and the real tx store. Only
- * the edges are faked — the Soroban RPC server, the Freighter wallet and the
- * toast library — so nothing here touches the network.
+ * The real pieces run: `useListBot` -> `executeTransaction` -> `signTx` -> the
+ * real stellar-sdk building a real `list_bot` invocation, and the real tx
+ * store. Only the edges are faked — the Soroban RPC server, the Freighter
+ * wallet, the SDK's `assembleTransaction` and the toast library — so nothing
+ * here touches the network.
  *
  * Every failure path asserts the same invariant: no stage of a failed
  * transaction ever fires a success toast.
  *
  * Fixtures below cover the whole RPC surface the pipeline uses:
- * getAccount, simulateTransaction (consumed by prepareTransaction, the
- * "assemble" step), sendTransaction and the getTransaction poll.
+ * getAccount, simulateTransaction (whose response feeds the "assemble" step),
+ * sendTransaction and the getTransaction poll.
  */
 
 import React from "react";
@@ -20,8 +21,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Account, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 import { toast } from "sonner";
 import { useListBot } from "@/hooks/useMarketplace";
-import { resumePendingTransactions } from "@/lib/transaction";
-import { MARKETPLACE_CONTRACT_ID } from "@/lib/constants";
+import { resumePendingTransactions, __resetSequenceStateForTests } from "@/lib/transaction";
+import { MARKETPLACE_CONTRACT_ID, STELLAR_NETWORK_PASSPHRASE } from "@/lib/constants";
 import { useTxStore, type TxRecord } from "@/store/txStore";
 import { useWalletStore } from "@/store/walletStore";
 
@@ -41,23 +42,36 @@ jest.mock("@/lib/constants", () => {
 const mockServer = {
   getAccount: jest.fn(),
   simulateTransaction: jest.fn(),
-  prepareTransaction: jest.fn(),
   sendTransaction: jest.fn(),
   getTransaction: jest.fn(),
 };
 
-// Keep the real ScVal helpers; only the RPC server is replaced.
+// Keep the real signTx / ScVal helpers; only the RPC server is replaced.
 jest.mock("@/lib/stellar", () => ({
   ...jest.requireActual("@/lib/stellar"),
   getServer: () => mockServer,
+  rpcCall: (fn: (server: unknown) => unknown) => fn(mockServer),
 }));
 
-const mockSign = jest.fn();
+// `assembleTransaction` needs a byte-accurate simulation response to run for
+// real; it is replaced so the test can assert exactly what reaches it and what
+// gets signed afterwards. Everything else in the SDK is real.
+const mockAssemble = jest.fn();
+jest.mock("@stellar/stellar-sdk", () => {
+  const actual = jest.requireActual("@stellar/stellar-sdk");
+  return {
+    ...actual,
+    SorobanRpc: {
+      ...actual.SorobanRpc,
+      assembleTransaction: (...args: unknown[]) => mockAssemble(...args),
+    },
+  };
+});
 
-// transaction.ts signs through `freighter.sign`.
+const mockSignTransaction = jest.fn();
 jest.mock("@stellar/freighter-api", () => ({
   __esModule: true,
-  sign: (...args: unknown[]) => mockSign(...args),
+  signTransaction: (...args: unknown[]) => mockSignTransaction(...args),
 }));
 
 jest.mock("sonner", () => ({
@@ -101,6 +115,9 @@ const sendError = {
   errorResultXdr: "AAAAAAAAAGT/////AAAAAQAAAAAAAAAB////+gAAAAA=",
 };
 
+/** sendTransaction rejected the transaction for a stale sequence number. */
+const sendBadSeq = { ...sendError, errorResultXdr: "txBAD_SEQ" };
+
 /** getTransaction poll responses. */
 const getNotFound = { ...LEDGER_INFO, status: "NOT_FOUND" };
 const getSuccess = {
@@ -117,13 +134,16 @@ const getFailed = {
 };
 
 /** Freighter's answers to a sign request. */
-const signApproved = { signedTransaction: SIGNED_XDR };
+const signApproved = { signedTxXdr: SIGNED_XDR, signerAddress: "GSIGNER" };
 const signRejected = { error: { code: -4, message: "User declined access" } };
 
 // ── Harness ─────────────────────────────────────────────────────────────────
 
+const realSetTimeout = global.setTimeout;
+
 let seller: string;
 let clock: jest.SpyInstance | undefined;
+let timers: jest.SpyInstance | undefined;
 let consoleError: jest.SpyInstance;
 
 const successToast = toast.success as jest.Mock;
@@ -131,43 +151,48 @@ const errorToast = toast.error as jest.Mock;
 const loadingToast = toast.loading as jest.Mock;
 
 beforeAll(() => {
-  // 1ms polls keep the real-timer loops instant; the contract ID is read by
-  // the hook straight from the environment.
-  process.env.NEXT_PUBLIC_POLL_INTERVAL_MS = "1";
+  // The hook reads the contract ID straight from the environment; resume polls
+  // at 1ms so its real-timer loops stay instant.
   process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID = MARKETPLACE_CONTRACT_ID;
+  process.env.NEXT_PUBLIC_POLL_INTERVAL_MS = "1";
 });
 
 afterAll(() => {
-  delete process.env.NEXT_PUBLIC_POLL_INTERVAL_MS;
   delete process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID;
+  delete process.env.NEXT_PUBLIC_POLL_INTERVAL_MS;
 });
 
 beforeEach(() => {
   jest.resetAllMocks();
   localStorage.clear();
   useTxStore.setState({ transactions: [] });
+  __resetSequenceStateForTests();
 
-  // A fresh account per test: sequence tracking is per-address module state.
   seller = Keypair.random().publicKey();
   useWalletStore.setState({ status: "connected", publicKey: seller, network: "TESTNET" });
+
+  // The confirmation poll sleeps 1s..8s between reads; collapse those waits so
+  // the loop runs at full speed. Every other timer is left alone.
+  timers = jest.spyOn(global, "setTimeout").mockImplementation(((
+    callback: () => void,
+    ms?: number,
+    ...args: unknown[]
+  ) =>
+    realSetTimeout(
+      callback,
+      typeof ms === "number" && ms >= 1_000 && ms <= 8_000 ? 0 : ms,
+      ...args
+    )) as unknown as typeof setTimeout);
 
   // The mutation's onError logs; keep the output readable.
   consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
 
   mockServer.getAccount.mockImplementation(async (address: string) => new Account(address, "100"));
   mockServer.simulateTransaction.mockResolvedValue(simulateSuccess);
-  // Mirrors SorobanRpc.Server#prepareTransaction: simulate, throw if the
-  // simulation failed, otherwise return the transaction with the resource fee
-  // and footprint attached.
-  mockServer.prepareTransaction.mockImplementation(async (tx: { fee: string }) => {
-    const simulation = await mockServer.simulateTransaction(tx);
-    if ("error" in simulation) throw new Error(simulation.error);
-    return {
-      fee: String(Number(tx.fee) + Number(simulation.minResourceFee)),
-      toXDR: () => ASSEMBLED_XDR,
-    };
-  });
-  mockSign.mockResolvedValue(signApproved);
+  mockAssemble.mockImplementation(() => ({
+    build: () => ({ fee: "58281", toXDR: () => ASSEMBLED_XDR }),
+  }));
+  mockSignTransaction.mockResolvedValue(signApproved);
   mockServer.sendTransaction.mockResolvedValue(sendPending);
   mockServer.getTransaction.mockResolvedValue(getSuccess);
 });
@@ -175,12 +200,14 @@ beforeEach(() => {
 afterEach(() => {
   clock?.mockRestore();
   clock = undefined;
+  timers?.mockRestore();
+  timers = undefined;
   consoleError.mockRestore();
 });
 
 /**
- * Make `Date.now()` jump 5s per call, so the pipeline's 40s confirmation
- * window elapses after a handful of 1ms polls instead of 40 real seconds.
+ * Make `Date.now()` jump 5s per call, so the pipeline's confirmation window
+ * elapses after a handful of instant polls instead of a real minute.
  */
 function accelerateClock(): void {
   let now = Date.now();
@@ -217,11 +244,10 @@ describe("transaction pipeline", () => {
 
     expect(error).toBeUndefined();
 
-    // Assemble step: the built list_bot call goes through prepareTransaction,
-    // and the wallet is asked to sign the *assembled* transaction — not the
-    // bare build, which lacks the resource fee and footprint.
-    expect(mockServer.prepareTransaction).toHaveBeenCalledTimes(1);
-    const built = mockServer.prepareTransaction.mock.calls[0][0];
+    // The built transaction is a real list_bot invocation with the contract's
+    // argument types, and it is what gets simulated.
+    expect(mockServer.simulateTransaction).toHaveBeenCalledTimes(1);
+    const built = mockServer.simulateTransaction.mock.calls[0][0];
     const invocation = built
       .toEnvelope()
       .v1()
@@ -236,13 +262,25 @@ describe("transaction pipeline", () => {
       ["scvAddress", "scvU64", "scvI128", "scvAddress"]
     );
 
-    expect(mockSign).toHaveBeenCalledWith(expect.objectContaining({ transactionXDR: ASSEMBLED_XDR }));
+    // Assemble step: the simulation result is folded into the built
+    // transaction, and the wallet is asked to sign the *assembled* result —
+    // not the bare build, which lacks the resource fee and footprint.
+    expect(mockAssemble).toHaveBeenCalledTimes(1);
+    expect(mockAssemble).toHaveBeenCalledWith(built, simulateSuccess);
+    expect(mockSignTransaction).toHaveBeenCalledWith(
+      ASSEMBLED_XDR,
+      expect.objectContaining({
+        networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+        address: seller,
+      })
+    );
     expect(mockServer.sendTransaction).toHaveBeenCalledWith(SIGNED_XDR);
     expect(mockServer.getTransaction).toHaveBeenCalledWith(TX_HASH);
 
     expect(loadingToast.mock.calls.map(([message]) => message)).toEqual([
-      "Preparing listing transaction...",
-      "Preparing listing transaction...",
+      "Preparing listing transaction...", // building
+      "Preparing listing transaction...", // simulating
+      "Preparing listing transaction...", // assembling
       "Waiting for wallet signature...",
       "Submitting listing to blockchain...",
       `Confirming on-chain... (${TX_HASH.slice(0, 8)})`,
@@ -271,14 +309,15 @@ describe("transaction pipeline", () => {
       expect.stringContaining("HostError: Error(Contract, #4)"),
       expect.anything()
     );
-    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockAssemble).not.toHaveBeenCalled();
+    expect(mockSignTransaction).not.toHaveBeenCalled();
     expect(mockServer.sendTransaction).not.toHaveBeenCalled();
     expect(successToast).not.toHaveBeenCalled();
     expect(storedTransactions()).toEqual([]);
   });
 
   it("user rejection: a declined signature stops before submission", async () => {
-    mockSign.mockResolvedValue(signRejected);
+    mockSignTransaction.mockResolvedValue(signRejected);
 
     const { error } = await submitListing();
 
@@ -327,9 +366,9 @@ describe("transaction pipeline", () => {
 
     const { error } = await submitListing();
 
-    expect(error?.message).toBe("Transaction confirmation timeout");
+    expect(error?.message).toContain("not confirmed within");
     expect(errorToast).toHaveBeenCalledWith(
-      "Listing failed: Transaction confirmation timeout",
+      expect.stringContaining("not confirmed within"),
       expect.anything()
     );
     expect(successToast).not.toHaveBeenCalled();
@@ -339,17 +378,22 @@ describe("transaction pipeline", () => {
     ]);
   });
 
-  it("txBAD_SEQ retry: a sequence conflict is retried once, then succeeds", async () => {
-    mockServer.sendTransaction
-      .mockRejectedValueOnce(new Error("txBAD_SEQ"))
-      .mockResolvedValue(sendPending);
+  it("txBAD_SEQ retry: a sequence conflict is rebuilt, re-signed and resubmitted once", async () => {
+    mockServer.sendTransaction.mockResolvedValueOnce(sendBadSeq).mockResolvedValue(sendPending);
 
     const { error } = await submitListing();
 
     expect(error).toBeUndefined();
+    // The retry starts over from a refreshed account: it is a new build, a new
+    // assembly and a new signature — not a resend of the stale signed XDR.
+    expect(mockAssemble).toHaveBeenCalledTimes(2);
+    expect(mockSignTransaction).toHaveBeenCalledTimes(2);
     expect(mockServer.sendTransaction).toHaveBeenCalledTimes(2);
     expect(successToast).toHaveBeenCalledTimes(1);
     expect(errorToast).not.toHaveBeenCalled();
+    expect(storedTransactions()).toEqual([
+      expect.objectContaining({ hash: TX_HASH, status: "success" }),
+    ]);
   });
 });
 

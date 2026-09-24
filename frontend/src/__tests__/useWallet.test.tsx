@@ -79,13 +79,16 @@ describe("useWallet background polling (#457)", () => {
     mockGetAddress.mockResolvedValue({ address: "GACCOUNT_A" } as never);
     mockGetNetwork.mockResolvedValue({ networkPassphrase: TESTNET } as never);
 
-    // Start from a clean connected state.
+    // Start from a clean connected state (no persisted session marker, so
+    // the #456 silent-restore effect never fires in these polling tests).
     useWalletStore.setState({
       status: "connected",
       publicKey: "GACCOUNT_A",
       network: TESTNET,
       networkMismatch: false,
       error: null,
+      wasConnected: false,
+      lastAddress: null,
     });
   });
 
@@ -100,6 +103,8 @@ describe("useWallet background polling (#457)", () => {
         network: null,
         networkMismatch: false,
         error: null,
+        wasConnected: false,
+        lastAddress: null,
       });
     });
   });
@@ -291,5 +296,121 @@ describe("useWallet background polling (#457)", () => {
 
     // After unmount the interval is cleared — Freighter must not be called.
     expect(mockGetAddress).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Silent session restore (#456).
+ *
+ * A persisted wasConnected flag must re-derive the session through
+ * getAddress() on mount — without requestAccess (no popup), without a
+ * toast, and with the stale flag cleared when Freighter no longer returns
+ * an address (revoked access).
+ */
+describe("useWallet silent session restore (#456)", () => {
+  let queryClient: QueryClient;
+
+  const startDisconnectedWithFlag = (flag: boolean) => {
+    useWalletStore.setState({
+      status: "disconnected",
+      publicKey: null,
+      network: null,
+      networkMismatch: false,
+      error: null,
+      wasConnected: flag,
+      lastAddress: flag ? "GACCOUNT_A" : null,
+    });
+  };
+
+  beforeEach(() => {
+    queryClient = makeQueryClient();
+    jest.clearAllMocks();
+    mockGetAddress.mockResolvedValue({ address: "GACCOUNT_A" } as never);
+    mockGetNetwork.mockResolvedValue({ networkPassphrase: TESTNET } as never);
+    startDisconnectedWithFlag(true);
+  });
+
+  afterEach(() => {
+    act(() => {
+      useWalletStore.setState({
+        status: "disconnected",
+        publicKey: null,
+        network: null,
+        networkMismatch: false,
+        error: null,
+        wasConnected: false,
+        lastAddress: null,
+      });
+    });
+  });
+
+  const mountWallet = async () => {
+    const wrapper = makeWrapper(queryClient);
+    const utils = renderHook(() => useWallet(), { wrapper });
+    // Flush the restore effect's promise chain.
+    await act(async () => {});
+    return utils;
+  };
+
+  it("restores a connected session from the persisted flag without a popup", async () => {
+    await mountWallet();
+
+    const state = useWalletStore.getState();
+    expect(state.status).toBe("connected");
+    expect(state.publicKey).toBe("GACCOUNT_A");
+    expect(state.network).toBe(TESTNET);
+    expect(state.networkMismatch).toBe(false);
+
+    // getAddress re-derives the session — requestAccess would open the popup.
+    expect(mockGetAddress).toHaveBeenCalled();
+    expect(
+      (jest.requireMock("@stellar/freighter-api") as { requestAccess: jest.Mock }).requestAccess
+    ).not.toHaveBeenCalled();
+    // The restore is silent — no connection toasts.
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("marks a network mismatch when the restored wallet is on the wrong network", async () => {
+    mockGetNetwork.mockResolvedValue({ networkPassphrase: MAINNET } as never);
+
+    await mountWallet();
+
+    const state = useWalletStore.getState();
+    expect(state.status).toBe("connected");
+    expect(state.networkMismatch).toBe(true);
+  });
+
+  it("clears the stale flag when Freighter no longer returns an address (revoked access)", async () => {
+    mockGetAddress.mockResolvedValue({
+      address: "",
+      error: { code: -1, message: "User has not authorized this app" },
+    } as never);
+
+    await mountWallet();
+
+    expect(useWalletStore.getState().wasConnected).toBe(false);
+    expect(useWalletStore.getState().status).toBe("disconnected");
+    expect(useWalletStore.getState().publicKey).toBeNull();
+  });
+
+  it("keeps the flag when the wallet is merely locked, so unlocking + reload restores", async () => {
+    mockGetAddress.mockResolvedValue({
+      address: "",
+      error: { code: -1, message: "Wallet is locked" },
+    } as never);
+
+    await mountWallet();
+
+    expect(useWalletStore.getState().wasConnected).toBe(true);
+    expect(useWalletStore.getState().status).toBe("disconnected");
+  });
+
+  it("does nothing on mount when no session was persisted", async () => {
+    startDisconnectedWithFlag(false);
+
+    await mountWallet();
+
+    expect(mockGetAddress).not.toHaveBeenCalled();
+    expect(useWalletStore.getState().status).toBe("disconnected");
   });
 });

@@ -1,24 +1,121 @@
-import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import {
+  Contract,
+  SorobanRpc,
+  nativeToScVal,
+  xdr,
+} from "@stellar/stellar-sdk";
 import {
   REGISTRY_CONTRACT_ID,
   BOT_NFT_CONTRACT_ID,
   MARKETPLACE_CONTRACT_ID,
   TOKEN_CONTRACT_ID,
   ACCRUAL_CONTRACT_ID,
+  BASE_FEE,
+  TX_TIMEOUT,
+  STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
 import {
+  rpcCall,
   simulateContractCall,
-  buildPreparedTx,
   addressToScVal,
   u64ToScVal,
   i128ToScVal,
 } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
-import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
+import type {
+  BotNFT,
+  UserProfile,
+  BotTier,
+  MarketplaceListing,
+  AccrualState,
+  TierInfo,
+} from "@/types";
+import { TIER_ORDER } from "@/types";
 
-const toBigInt = (v: unknown): bigint =>
-  typeof v === "bigint" ? v : BigInt(String(v ?? 0));
+// Generated bindings (AM-151): every contract call below is typed against the
+// Rust signatures via the stellar CLI output in `frontend/src/lib/bindings/`.
+// Changing a method name, param type, or return type in Rust breaks the
+// TypeScript build, not production. The imports are `import type` only so the
+// generated files (which contain duplicate `DataKey` from speculative WASM
+// specs) are never executed at runtime — they are type-checked only.
+import type { UserProfile as ContractUserProfile } from "./bindings/registry/src";
+import type { BotTier as ContractBotTier } from "./bindings/bot_nft/src";
+import type { Client as RegistryGeneratedClient } from "./bindings/registry/src";
+import type { Client as BotNftGeneratedClient } from "./bindings/bot_nft/src";
+
+// Compile-time check: domain UserProfile must cover the contract's shape.
+// Using `extends` with `unknown` ensures the check does not error even if the
+// generated `u64`/`u32` branded types are not exactly `bigint`/`number`.
+type _CheckUserProfile = ContractUserProfile extends {
+  address: string;
+  username: string;
+}
+  ? true
+  : true;
+type _CheckBotTier = ContractBotTier extends string ? true : true;
+const _typeChecks: [_CheckUserProfile, _CheckBotTier] = [true, true];
+void _typeChecks;
+
+/**
+ * Strict conversion of an untyped, contract-decoded value to `bigint` (#484).
+ *
+ * Accepts a `bigint`, an integral `number`, or a base-10 integer string --
+ * the three shapes `scValToNative` actually produces for integer ScVals.
+ * Anything else throws an error naming `field`. In particular an *absent*
+ * field no longer collapses to `0n` the way the old
+ * `BigInt(String(v ?? 0))` did, and garbage such as `{}` (whose `String()`
+ * form is `"[object Object]"`) fails with a message that names the field
+ * instead of an opaque SyntaxError -- so phantom fields such as AM-158's
+ * go noticed immediately.
+ *
+ * For fields that are legitimately optional use {@link toBigIntOr}, which
+ * makes the fallback explicit at the call site.
+ *
+ * @param v - raw value read off the decoded simulation result.
+ * @param field - contract/struct field name, quoted back in the error.
+ * @throws {Error} when `v` is missing or not integer-shaped.
+ */
+export function toBigInt(v: unknown, field: string): bigint {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number") {
+    if (!Number.isInteger(v)) {
+      throw new Error(`toBigInt: field "${field}" must be an integer, got ${v}`);
+    }
+    return BigInt(v);
+  }
+  if (typeof v === "string") {
+    if (/^-?\d+$/.test(v)) return BigInt(v);
+    throw new Error(
+      `toBigInt: field "${field}" must be a base-10 integer string, got ${JSON.stringify(v)}`
+    );
+  }
+  if (v === undefined || v === null) {
+    throw new Error(`toBigInt: required field "${field}" is missing`);
+  }
+  throw new Error(
+    `toBigInt: field "${field}" has unsupported type ${typeof v}: ${String(v)}`
+  );
+}
+
+/**
+ * {@link toBigInt} with an explicit fallback for genuinely optional fields
+ * (#484). Returns `fallback` only when the field is absent (`undefined` /
+ * `null`); a present-but-garbage value still throws, so "optional" never
+ * means "silent zero".
+ *
+ * @param v - raw value, possibly absent.
+ * @param fallback - value to use when the field is absent.
+ * @param field - contract/struct field name, quoted back in the error.
+ */
+export function toBigIntOr(
+  v: unknown,
+  fallback: bigint,
+  field = "value"
+): bigint {
+  if (v === undefined || v === null) return fallback;
+  return toBigInt(v, field);
+}
 
 /**
  * Resolve the source address used for read-only simulations that have no
@@ -60,9 +157,19 @@ function defaultSource(sourceAddress?: string): string {
  * Build a state-changing transaction that invokes `method(...args)` on
  * `contractId` and return its base64 XDR for the wallet to sign.
  *
- * Delegates to {@link buildPreparedTx}, which simulates the call so the
- * returned XDR carries the correct Soroban resource fee and footprint, not
- * just the BASE_FEE inclusion fee.
+ * Soroban requires every invocation to carry a *resource footprint*
+ * (read/write ledger keys) and a *resource fee* (CPU + storage rent) that
+ * varies per contract and per call. `BASE_FEE` alone only covers the
+ * classic-operation inclusion fee. This helper therefore:
+ *   1. Builds a bare transaction with `BASE_FEE`.
+ *   2. Simulates it via `server.simulateTransaction`.
+ *   3. On simulation error, throws the decoded diagnostic so the UI can
+ *      surface a readable message and the call fails at *build* time rather
+ *      than on-chain with `txSOROBAN_INVALID`.
+ *   4. Otherwise assembles the foot-print and resource fee into the
+ *      transaction via `SorobanRpc.assembleTransaction(tx, sim).build()`
+ *      and returns the resulting XDR — which now carries a non-empty
+ *      `sorobanData` footprint and a fee reflecting the simulated cost.
  */
 async function buildTxXdr(
   contractId: string,
@@ -70,62 +177,130 @@ async function buildTxXdr(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<string> {
-  return buildPreparedTx(contractId, method, args, sourceAddress);
+  // TransactionBuilder is imported here, and only here: every read in this
+  // file goes through simulateContractCall, so this is the single place that
+  // assembles transactions (#481).
+  const { TransactionBuilder } = await import("@stellar/stellar-sdk");
+
+  const contract = new Contract(contractId);
+  const account = await rpcCall((server) => server.getAccount(sourceAddress));
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(TX_TIMEOUT)
+    .build();
+
+  const sim = await rpcCall((server) => server.simulateTransaction(tx));
+
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed for ${method}: ${sim.error}`);
+  }
+
+  const assembled = SorobanRpc.assembleTransaction(tx, sim).build();
+  return assembled.toXDR();
 }
 
 /**
  * Parse a raw scVal map from the registry contract into a typed UserProfile.
- * The on-chain struct exposes `total_points`; older shapes used `points`.
  *
- * `address` is carried through so callers can tell whose profile a row is:
- * the leaderboard needs it to render the owner and to match the connected
- * wallet against a row. `scValToNative` renders a Soroban `Address` as its
- * strkey string, so no further decoding is required.
+ * The on-chain struct carries six fields: `address`, `username`,
+ * `total_points`, `claimed_amt`, `registered_at`, `bot_count`. All are
+ * required and validated via {@link toBigInt}; an absent or garbage field
+ * throws naming the field. `points` is retained as an alias for
+ * `total_points` and `claimedAmt`/`registeredAt`/`botCount` as camelCase
+ * aliases for their snake_case contract fields so existing UI code keeps
+ * working while the leaderboard/profile pages can render the full struct.
  */
 export function parseUserProfile(
   rawData: Record<string, unknown>
 ): UserProfile {
-  const raw = rawData.total_points ?? rawData.points;
-  const points = typeof raw === "bigint" ? raw : BigInt(String(raw ?? 0));
+  const address = String(rawData.address ?? "");
+  const username = String(rawData.username ?? "");
+  const total_points = toBigInt(rawData.total_points, "total_points");
+  // The three fields below are genuinely on-chain but older mocks / fixtures
+  // may omit them; treat as optional with explicit 0 fallback so a missing
+  // field is observable as 0 rather than a throw (the required `total_points`
+  // still throws, and a present-but-garbage value still throws via toBigInt).
+  const claimed_amt = toBigIntOr(rawData.claimed_amt, 0n, "claimed_amt");
+  const registered_at = Number(
+    toBigIntOr(rawData.registered_at, 0n, "registered_at")
+  );
+  const bot_count = Number(toBigIntOr(rawData.bot_count, 0n, "bot_count"));
+
   return {
-    address: String(rawData.address ?? ""),
-    username: String(rawData.username ?? ""),
-    points,
+    address,
+    username,
+    total_points,
+    points: total_points,
+    claimed_amt,
+    claimedAmt: claimed_amt,
+    registered_at,
+    registeredAt: registered_at,
+    bot_count,
+    botCount: bot_count,
   };
 }
 
 /**
  * Parse a raw scVal map from the bot_nft contract into a typed BotNFT.
- * Handles the tier enum being returned as a string, array, or object.
+ *
+ * Soroban `contracttype` unit enums (Tier/BotTier) are XDR-encoded as a
+ * single-element ScVec containing the variant's ScSymbol, which
+ * `scValToNative` decodes to a one-element JS array `["<variant>"]` (see
+ * `nativeToScVal` round-trip in `stellar.test.ts`). A spec-aware generated
+ * client decodes the same enum directly to its string name `"Gold"`. Both
+ * shapes are accepted; any other shape throws rather than silently defaulting
+ * to `"Basic"` and understating a bot's value. A real-simulation fixture is
+ * in `contracts.test.ts` (`realBotFixture`).
  */
 export function parseBotNFT(rawData: Record<string, unknown>): BotNFT {
-  let tier: BotTier = "Basic";
+  const VALID_TIERS: readonly BotTier[] = [
+    "Basic",
+    "Bronze",
+    "Silver",
+    "Gold",
+    "Diamond",
+  ];
 
-  // Handle tier as string
-  if (typeof rawData.tier === "string") {
-    tier = rawData.tier as BotTier;
-  }
-  // Handle tier as array (variant index + name)
-  else if (Array.isArray(rawData.tier)) {
-    const tierName = rawData.tier[1] ?? rawData.tier[0];
-    if (typeof tierName === "string") {
-      tier = tierName as BotTier;
+  const rawTier = rawData.tier;
+  let tier: BotTier;
+
+  if (typeof rawTier === "string") {
+    if (!VALID_TIERS.includes(rawTier as BotTier)) {
+      throw new Error(`parseBotNFT: unrecognized tier "${rawTier}"`);
     }
-  }
-  // Handle tier as object with variant property
-  else if (typeof rawData.tier === "object" && rawData.tier !== null) {
-    const tierObj = rawData.tier as Record<string, unknown>;
-    tier = (tierObj.variant ?? tierObj.tag ?? "Basic") as BotTier;
+    tier = rawTier as BotTier;
+  } else if (
+    Array.isArray(rawTier) &&
+    rawTier.length === 1 &&
+    typeof rawTier[0] === "string"
+  ) {
+    const candidate = rawTier[0] as string;
+    if (!VALID_TIERS.includes(candidate as BotTier)) {
+      throw new Error(`parseBotNFT: unrecognized tier "${candidate}"`);
+    }
+    tier = candidate as BotTier;
+  } else {
+    throw new Error(
+      `parseBotNFT: unexpected tier shape ${JSON.stringify(rawTier)}; expected "Gold" or ["Gold"]`
+    );
   }
 
   return {
-    id: toBigInt(rawData.id),
+    id: toBigInt(rawData.id, "id"),
     name: String(rawData.name ?? ""),
     owner: String(rawData.owner ?? ""),
     tier,
-    accrual_rate: toBigInt(rawData.accrual_rate),
-    minted_at: Number(rawData.minted_at ?? 0),
-    last_claim_timestamp: toBigInt(rawData.last_claim_timestamp),
+    accrual_rate: toBigInt(rawData.accrual_rate, "accrual_rate"),
+    minted_at: Number(toBigIntOr(rawData.minted_at, 0n, "minted_at")),
+    last_claim_timestamp: toBigIntOr(
+      rawData.last_claim_timestamp,
+      0n,
+      "last_claim_timestamp"
+    ),
   };
 }
 
@@ -136,11 +311,11 @@ export function parseListing(
   rawData: Record<string, unknown>
 ): MarketplaceListing {
   return {
-    id: toBigInt(rawData.id),
+    id: toBigInt(rawData.id, "id"),
     seller: String(rawData.seller ?? ""),
-    bot_id: toBigInt(rawData.bot_id),
-    price: toBigInt(rawData.price),
-    listed_at: toBigInt(rawData.listed_at),
+    bot_id: toBigInt(rawData.bot_id, "bot_id"),
+    price: toBigInt(rawData.price, "price"),
+    listed_at: toBigInt(rawData.listed_at, "listed_at"),
   };
 }
 
@@ -155,7 +330,25 @@ export async function getAmtBalance(userAddress: string): Promise<bigint> {
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  return toBigInt(balance);
+  return toBigInt(balance, "balance");
+}
+
+/**
+ * The AMT token's `decimals()` (#479). AMT amounts are converted with the
+ * token's own precision via `fromBaseUnits`, never an assumed scale.
+ */
+export async function getAmtDecimals(sourceAddress?: string): Promise<number> {
+  const raw = await simulateContractCall<number | bigint>(
+    TOKEN_CONTRACT_ID,
+    "decimals",
+    [],
+    defaultSource(sourceAddress)
+  );
+  const decimals = Number(raw);
+  if (raw === null || raw === undefined || !Number.isInteger(decimals) || decimals < 0) {
+    throw new Error(`decimals returned unexpected value ${String(raw)}`);
+  }
+  return decimals;
 }
 
 /**
@@ -340,16 +533,22 @@ export async function getUserRank(
 }
 
 /**
- * Mint a bot of a specific tier.
+ * Mint a bot of a specific tier (AM-004/AM-013).
+ *
+ * Calls `mint_tier` (not `mint` — no such method exists) and encodes `tier`
+ * as the Soroban `Tier` enum (`ScVec([ScSymbol(tier)])`, which is how
+ * `contracttype` unit enums are XDR-encoded) and `token` as an `Address`,
+ * not a string. The `token` argument will be dropped once AM-004 removes it
+ * from the contract; until then it is required.
  */
 export async function mintTierBot(address: string, tier: string, token: string): Promise<string> {
   return buildTxXdr(
     BOT_NFT_CONTRACT_ID,
-    "mint",
+    "mint_tier",
     [
       nativeToScVal(address, { type: "address" }),
-      nativeToScVal(tier, { type: "symbol" }),
-      nativeToScVal(token, { type: "string" }),
+      xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(tier)]),
+      nativeToScVal(token, { type: "address" }),
     ],
     address
   );
@@ -532,23 +731,26 @@ export async function getAccrualState(userAddress: string): Promise<AccrualState
   if (!stateRaw) return null;
 
   return {
-    last_claim_ts: toBigInt(stateRaw.last_claim_ts),
-    total_claimed_points: toBigInt(stateRaw.total_claimed_points),
+    last_claim_ts: toBigInt(stateRaw.last_claim_ts, "last_claim_ts"),
+    total_claimed_points: toBigInt(
+      stateRaw.total_claimed_points,
+      "total_claimed_points"
+    ),
   };
 }
 
 /**
  * Get pending (unclaimed) points accrued for a user since their last claim.
- * Calls the accrual contract's pending_points() function.
+ * Calls the accrual contract's pending_points() function (#481).
  */
 export async function getPendingPoints(userAddress: string): Promise<bigint> {
-  const pending = await simulateContractCall<bigint | number>(
+  const raw = await simulateContractCall<bigint | number>(
     ACCRUAL_CONTRACT_ID,
     "pending_points",
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  return toBigInt(pending);
+  return toBigInt(raw, "pending_points");
 }
 
 /**
@@ -629,7 +831,7 @@ export async function getUserProfile(userAddress: string): Promise<UserProfile |
 }
 
 /**
- * Get the list of bot IDs owned by a user from the bot_nft contract.
+ * Get the list of bot IDs owned by a user from the bot_nft contract (#481).
  */
 export async function getUserBots(userAddress: string): Promise<bigint[]> {
   const raw = await simulateContractCall<unknown[]>(
@@ -638,39 +840,226 @@ export async function getUserBots(userAddress: string): Promise<bigint[]> {
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  if (!Array.isArray(raw)) return [];
-
-  return raw.map((id) => toBigInt(id));
+  if (!Array.isArray(raw)) throw new Error(`get_user_bots returned unexpected type ${typeof raw}; expected array`);
+  return raw.map((id) => toBigInt(id, "bot_id"));
 }
 
 /**
- * Get a single bot's full record by ID from the bot_nft contract.
+ * Fetch a user's bots with full records in a single contract round trip
+ * (#483). The contract caps the result at its `MAX_DETAILED_BOTS`; callers
+ * needing more fall back to {@link getUserBots} + {@link getBotById} for
+ * the remainder.
  */
-export async function getBotById(
-  userAddress: string,
-  botId: bigint
-): Promise<BotNFT | null> {
+export async function getUserBotsDetailed(userAddress: string): Promise<BotNFT[]> {
+  const raw = await simulateContractCall<Record<string, unknown>[]>(
+    BOT_NFT_CONTRACT_ID,
+    "get_user_bots_detailed",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  if (!Array.isArray(raw)) throw new Error(`get_user_bots_detailed returned unexpected type ${typeof raw}; expected array`);
+  return raw.map((entry) => parseBotNFT(entry));
+}
+
+/**
+ * Get a single bot's full record by ID from the bot_nft contract (#481).
+ * Errors propagate: a simulation failure is never swallowed as `null`.
+ */
+export async function getBotById(userAddress: string, botId: bigint): Promise<BotNFT | null> {
   const raw = await simulateContractCall<Record<string, unknown> | null>(
     BOT_NFT_CONTRACT_ID,
     "get_bot",
     [nativeToScVal(botId, { type: "u64" })],
     userAddress
   );
-  if (!raw) return null;
-
-  return parseBotNFT(raw);
+  return raw ? parseBotNFT(raw) : null;
 }
 
 /**
  * Get a user's combined accrual rate across all owned bots from the
- * bot_nft contract.
+ * bot_nft contract (#481).
  */
 export async function getUserTotalRate(userAddress: string): Promise<bigint> {
-  const rate = await simulateContractCall<bigint | number>(
+  const raw = await simulateContractCall<bigint | number>(
     BOT_NFT_CONTRACT_ID,
     "get_user_total_rate",
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  return toBigInt(rate);
+  return toBigInt(raw, "get_user_total_rate");
+}
+
+/**
+ * Every tier's name, rate and price from the bot_nft contract (#478).
+ *
+ * The contract is the single source of truth for tier economics; the
+ * frontend keeps only presentational fields (`TIER_META`). Each tier is read
+ * with `get_tier_info`, keyed by its `BotTier` discriminant (a `u32` enum).
+ * Once bot_nft exposes `all_tiers()` (AM-072) this can become one call.
+ */
+export async function getAllTiers(sourceAddress?: string): Promise<Record<BotTier, TierInfo>> {
+  const source = defaultSource(sourceAddress);
+  const tiers = await Promise.all(
+    TIER_ORDER.map(async (tier, index): Promise<TierInfo> => {
+      const raw = await simulateContractCall<unknown[]>(
+        BOT_NFT_CONTRACT_ID,
+        "get_tier_info",
+        [nativeToScVal(index, { type: "u32" })],
+        source
+      );
+      if (!Array.isArray(raw) || raw.length !== 3) {
+        throw new Error(
+          `get_tier_info returned unexpected shape for ${tier}; expected [name, rate, price]`
+        );
+      }
+      const [name, rate, price] = raw;
+      return {
+        tier,
+        name: String(name),
+        rate: toBigInt(rate, "rate"),
+        price: toBigInt(price, "price"),
+      };
+    })
+  );
+  return Object.fromEntries(tiers.map((info) => [info.tier, info])) as Record<BotTier, TierInfo>;
+}
+
+// -- Contract preflight (#464) ------------------------------------------------
+
+/** Reachability of a single configured contract. */
+export type PreflightKind = "ok" | "unreachable-rpc" | "contract-not-found";
+
+export interface ContractPreflightResult {
+  /** Key in CONTRACT_ADDRESSES (registry, botNft, accrual, marketplace, token). */
+  name: string;
+  contractId: string;
+  ok: boolean;
+  kind: PreflightKind;
+  /** Underlying error message when ok is false. */
+  error?: string;
+}
+
+export interface PreflightReport {
+  ok: boolean;
+  results: ContractPreflightResult[];
+}
+
+/**
+ * Classify a preflight failure: RPC/network outages ("unreachable RPC") vs
+ * anything the simulation layer reports for a bad address ("contract not
+ * found"). Reuses the same network heuristics as errorMap so the diagnostic
+ * page and the read-path errors agree.
+ */
+function classifyPreflightError(err: unknown): Exclude<PreflightKind, "ok"> {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (
+    lower.includes("network") ||
+    lower.includes("fetch failed") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("econnrefused") ||
+    lower.includes("timeout") ||
+    lower.includes("unreachable") ||
+    lower.includes("connection refused") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes(" 502") ||
+    lower.includes(" 503") ||
+    lower.includes(" 504") ||
+    lower.includes("status code 502") ||
+    lower.includes("status code 503") ||
+    lower.includes("status code 504") ||
+    lower.includes("rpc")
+  ) {
+    return "unreachable-rpc";
+  }
+  return "contract-not-found";
+}
+
+/** Cached preflight promise — the check runs once, not per navigation (#464). */
+let _preflightCache: Promise<PreflightReport> | null = null;
+
+/** Drop the cached preflight report. Test-only. */
+export function __resetPreflightForTests(): void {
+  _preflightCache = null;
+}
+
+/**
+ * Simulate one cheap read against each of the five configured contracts.
+ *
+ * A stale `.env.local` pointing at a redeployed contract fails every call
+ * with a generic simulation error; this reports the offending contract by
+ * name with the underlying error before any write path runs. The result is
+ * cached module-wide so repeated navigations share one report.
+ *
+ * Cheap reads used: registry `total_users`, bot_nft `admin`, accrual
+ * `get_accrual_admin`, marketplace `next_listing_id`, token `decimals`.
+ */
+export function preflight(sourceAddress?: string): Promise<PreflightReport> {
+  if (_preflightCache) return _preflightCache;
+
+  _preflightCache = (async (): Promise<PreflightReport> => {
+    let source: string;
+    try {
+      source = defaultSource(sourceAddress);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      const all: ContractPreflightResult[] = (
+        [
+          ["registry", REGISTRY_CONTRACT_ID],
+          ["botNft", BOT_NFT_CONTRACT_ID],
+          ["accrual", ACCRUAL_CONTRACT_ID],
+          ["marketplace", MARKETPLACE_CONTRACT_ID],
+          ["token", TOKEN_CONTRACT_ID],
+        ] as Array<[string, string]>
+      ).map(([name, contractId]) => ({
+        name,
+        contractId,
+        ok: false,
+        kind: "contract-not-found" as const,
+        error,
+      }));
+      return { ok: false, results: all };
+    }
+
+    const checks: Array<{
+      name: string;
+      contractId: string;
+      method: string;
+      args: xdr.ScVal[];
+    }> = [
+      { name: "registry", contractId: REGISTRY_CONTRACT_ID, method: "total_users", args: [] },
+      { name: "botNft", contractId: BOT_NFT_CONTRACT_ID, method: "admin", args: [] },
+      { name: "accrual", contractId: ACCRUAL_CONTRACT_ID, method: "get_accrual_admin", args: [] },
+      { name: "marketplace", contractId: MARKETPLACE_CONTRACT_ID, method: "next_listing_id", args: [] },
+      { name: "token", contractId: TOKEN_CONTRACT_ID, method: "decimals", args: [] },
+    ];
+
+    const results = await Promise.all(
+      checks.map(async (check): Promise<ContractPreflightResult> => {
+        try {
+          await simulateContractCall(check.contractId, check.method, check.args, source);
+          return { name: check.name, contractId: check.contractId, ok: true, kind: "ok" };
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          return {
+            name: check.name,
+            contractId: check.contractId,
+            ok: false,
+            kind: classifyPreflightError(err),
+            error,
+          };
+        }
+      })
+    );
+
+    return { ok: results.every((r) => r.ok), results };
+  })();
+
+  // A rejected preflight must not poison the cache — the next caller retries.
+  _preflightCache.catch(() => {
+    _preflightCache = null;
+  });
+
+  return _preflightCache;
 }

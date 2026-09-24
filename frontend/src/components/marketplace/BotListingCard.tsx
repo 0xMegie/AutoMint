@@ -10,9 +10,9 @@ import {
   BOT_TIER_COLORS,
   BOT_TIER_BG_COLORS,
   TIER_META,
-  stroopsToXlm,
 } from "@/types";
 import type { MarketplaceListing, BotNFT } from "@/types";
+import { stroopsToXlm } from "@/lib/format";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 
 interface BotListingCardProps {
@@ -108,7 +108,7 @@ export default function BotListingCard({
               Rate
             </p>
             <p className="text-sm font-semibold text-text">
-              {(bot?.accrual_rate ?? BigInt(tierMeta?.rate || 1)).toString()}{" "}
+              {bot ? bot.accrual_rate.toString() : "—"}{" "}
               <span className="text-xs font-normal text-muted">pt/hr</span>
             </p>
           </div>
