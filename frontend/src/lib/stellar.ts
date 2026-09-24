@@ -340,8 +340,15 @@ export function boolToScVal(value: boolean): xdr.ScVal {
  * recent ledger was closed. Used to compute the client-clock offset so the
  * interpolated accrual counter stays accurate even when the browser clock is
  * skewed (#492).
+ *
+ * `getLatestLedger` only returns id/sequence/protocolVersion, so we probe
+ * `getTransaction` with a hash that cannot exist: every response shape —
+ * including NOT_FOUND — carries `latestLedgerCloseTime`. Goes through
+ * {@link rpcCall} so it inherits retry + endpoint failover.
  */
 export async function getLedgerCloseTime(): Promise<number> {
-  const ledger = await rpcCall((server) => server.getLatestLedger());
-  return Number(ledger.closeTime);
+  const result = await rpcCall((server) =>
+    server.getTransaction("0".repeat(64))
+  );
+  return Number(result.latestLedgerCloseTime);
 }
