@@ -11,42 +11,43 @@ import {
   useAnimatedPoints,
 } from '../hooks/useAccrual';
 import {
-  registerUser,
-  mintBasicBot,
-  startAccrual,
   isRegistered,
   getUserProfile,
   getUserBots,
   getAccrualState,
   getAmtBalance,
-  claimPoints,
 } from '@/lib/contracts';
+import { executeTransaction } from '@/lib/transaction';
 import { useWalletStore } from '@/store/walletStore';
 import { toast } from 'sonner';
 import type { UserProfile, AccrualState } from '@/types';
 
 // Mock dependencies
 jest.mock('@/lib/contracts');
+jest.mock('@/lib/transaction', () => ({
+  executeTransaction: jest.fn(),
+}));
 jest.mock('@/store/walletStore', () => ({
   ...jest.requireActual('@/store/walletStore'),
   useWalletStore: jest.fn(),
 }));
 jest.mock('sonner');
 
-const mockRegisterUser = registerUser as jest.MockedFunction<typeof registerUser>;
-const mockMintBasicBot = mintBasicBot as jest.MockedFunction<typeof mintBasicBot>;
-const mockStartAccrual = startAccrual as jest.MockedFunction<typeof startAccrual>;
 const mockIsRegistered = isRegistered as jest.MockedFunction<typeof isRegistered>;
 const mockGetUserProfile = getUserProfile as jest.MockedFunction<typeof getUserProfile>;
 const mockGetUserBots = getUserBots as jest.MockedFunction<typeof getUserBots>;
 const mockGetAccrualState = getAccrualState as jest.MockedFunction<typeof getAccrualState>;
 const mockGetAmtBalance = getAmtBalance as jest.MockedFunction<typeof getAmtBalance>;
-const mockClaimPoints = claimPoints as jest.MockedFunction<typeof claimPoints>;
+const mockExecuteTransaction = executeTransaction as jest.MockedFunction<
+  typeof executeTransaction
+>;
 const mockUseWalletStore = useWalletStore as jest.MockedFunction<typeof useWalletStore>;
 
 describe('useAccrual Hooks', () => {
   let queryClient: QueryClient;
-  const mockPublicKey = 'GABC123456';
+  // A structurally valid ed25519 public key — nativeToScVal(..., {type:
+  // "address"}) rejects placeholder strings like "GABC123".
+  const mockPublicKey = 'GD6VCGW7N4YUZUG2VKRN4DKIXGTBJZTZBV5ICATW2YCDCOS36VYPXAR3';
 
   beforeEach(() => {
     queryClient = new QueryClient({
@@ -62,6 +63,25 @@ describe('useAccrual Hooks', () => {
     (mockUseWalletStore as unknown as jest.Mock).mockImplementation((selector) =>
       selector({ publicKey: mockPublicKey })
     );
+
+    // Every transaction "confirms" immediately unless a test overrides it.
+    mockExecuteTransaction.mockImplementation(async (opts) => {
+      opts.onStatus({ stage: 'success', explorerUrl: 'https://explorer.test/tx/1' });
+      return 'ok';
+    });
+    // Default on-chain state: a completely fresh user.
+    mockIsRegistered.mockResolvedValue(false);
+    mockGetUserBots.mockResolvedValue([]);
+    mockGetAccrualState.mockResolvedValue(null);
+
+    // Contract IDs must be valid strkeys — useClaim runs them through
+    // nativeToScVal(..., {type: "address"}).
+    process.env.NEXT_PUBLIC_ACCRUAL_CONTRACT_ID =
+      'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+    process.env.NEXT_PUBLIC_TOKEN_CONTRACT_ID =
+      'CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ';
+    process.env.NEXT_PUBLIC_REGISTRY_CONTRACT_ID =
+      'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
   });
 
   afterEach(() => {
@@ -73,10 +93,46 @@ describe('useAccrual Hooks', () => {
   );
 
   describe('useRegister', () => {
-    it('should successfully register a user', async () => {
-      mockRegisterUser.mockResolvedValue('tx1');
-      mockMintBasicBot.mockResolvedValue(1n);
-      mockStartAccrual.mockResolvedValue('tx3');
+    it('runs all three steps sequentially for a fresh user (#452)', async () => {
+      const { result } = renderHook(() => useRegister(), { wrapper });
+
+      act(() => {
+        result.current.mutate('testuser');
+      });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+      // Resume detection ran first.
+      expect(mockIsRegistered).toHaveBeenCalledWith(mockPublicKey);
+      expect(mockGetUserBots).toHaveBeenCalledWith(mockPublicKey);
+      expect(mockGetAccrualState).toHaveBeenCalledWith(mockPublicKey);
+
+      // Exactly three transactions, in pipeline order, each awaiting the
+      // previous one's confirmation.
+      const methods = mockExecuteTransaction.mock.calls.map(
+        (call) => call[0].method
+      );
+      expect(methods).toEqual(['register', 'mint_basic', 'start_accrual']);
+      for (const [call] of mockExecuteTransaction.mock.calls) {
+        expect(call.sourceAddress).toBe(mockPublicKey);
+      }
+
+      expect(result.current.progress).toEqual({
+        stepIndex: 3,
+        step: 'done',
+      });
+      expect(toast.success).toHaveBeenCalledWith(
+        'Registration complete! Welcome to AutoMint!'
+      );
+    });
+
+    it('skips every step when the chain is already fully registered (#452)', async () => {
+      mockIsRegistered.mockResolvedValue(true);
+      mockGetUserBots.mockResolvedValue([1n]);
+      mockGetAccrualState.mockResolvedValue({
+        last_claim_ts: 1n,
+        total_claimed_points: 0n,
+      });
 
       const { result } = renderHook(() => useRegister(), { wrapper });
 
@@ -86,15 +142,68 @@ describe('useAccrual Hooks', () => {
 
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-      expect(mockRegisterUser).toHaveBeenCalledWith(mockPublicKey, 'testuser');
-      expect(mockMintBasicBot).toHaveBeenCalledWith(mockPublicKey);
-      expect(mockStartAccrual).toHaveBeenCalledWith(mockPublicKey, 1);
-      expect(toast.success).toHaveBeenCalledWith('Registration complete! Welcome to AutoMint!');
+      expect(mockExecuteTransaction).not.toHaveBeenCalled();
+      expect(toast.success).toHaveBeenCalledWith(
+        'Registration complete! Welcome to AutoMint!'
+      );
     });
 
-    it('should handle registration failure', async () => {
+    it('resumes at the mint step when registration already landed (#452)', async () => {
+      mockIsRegistered.mockResolvedValue(true);
+      mockGetUserBots.mockResolvedValue([]);
+      mockGetAccrualState.mockResolvedValue(null);
+
+      const { result } = renderHook(() => useRegister(), { wrapper });
+
+      act(() => {
+        result.current.mutate('testuser');
+      });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+      const methods = mockExecuteTransaction.mock.calls.map(
+        (call) => call[0].method
+      );
+      // register is NOT re-run — that would hit the registry's
+      // already-registered error and trap the user.
+      expect(methods).toEqual(['mint_basic', 'start_accrual']);
+    });
+
+    it('resumes at the accrual step when register and mint already landed (#452)', async () => {
+      mockIsRegistered.mockResolvedValue(true);
+      mockGetUserBots.mockResolvedValue([7n]);
+      mockGetAccrualState.mockResolvedValue(null);
+
+      const { result } = renderHook(() => useRegister(), { wrapper });
+
+      act(() => {
+        result.current.mutate('testuser');
+      });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+      const methods = mockExecuteTransaction.mock.calls.map(
+        (call) => call[0].method
+      );
+      expect(methods).toEqual(['start_accrual']);
+    });
+
+    it('ends in a done progress state with no pending timers (#452)', async () => {
+      const { result } = renderHook(() => useRegister(), { wrapper });
+
+      act(() => {
+        result.current.mutate('testuser');
+      });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.progress).toEqual({ stepIndex: 3, step: 'done' });
+      // No artificial delay: the mutation settles without timers (#452).
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('propagates a failed step and leaves later steps unrun (#452)', async () => {
       const error = new Error('Registration failed');
-      mockRegisterUser.mockRejectedValue(error);
+      mockExecuteTransaction.mockImplementation(() => Promise.reject(error));
 
       const { result } = renderHook(() => useRegister(), { wrapper });
 
@@ -105,7 +214,11 @@ describe('useAccrual Hooks', () => {
       await waitFor(() => expect(result.current.isError).toBe(true));
 
       expect(result.current.error).toEqual(error);
-      expect(toast.error).toHaveBeenCalledWith('Registration failed');
+      // Stops after the first failure — no mint/accrual attempts.
+      expect(mockExecuteTransaction).toHaveBeenCalledTimes(1);
+      expect(toast.success).not.toHaveBeenCalledWith(
+        'Registration complete! Welcome to AutoMint!'
+      );
     });
 
     it('should throw error when wallet not connected', async () => {
@@ -122,6 +235,7 @@ describe('useAccrual Hooks', () => {
       await waitFor(() => expect(result.current.isError).toBe(true));
 
       expect(result.current.error).toEqual(new Error('Wallet not connected'));
+      expect(mockIsRegistered).not.toHaveBeenCalled();
     });
   });
 
@@ -282,8 +396,6 @@ describe('useAccrual Hooks', () => {
 
   describe('useClaim', () => {
     it('should successfully claim points', async () => {
-      mockClaimPoints.mockResolvedValue('tx_hash');
-
       const { result } = renderHook(() => useClaim(), { wrapper });
 
       act(() => {
@@ -292,13 +404,22 @@ describe('useAccrual Hooks', () => {
 
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-      expect(mockClaimPoints).toHaveBeenCalledWith(mockPublicKey);
-      expect(toast.success).toHaveBeenCalledWith('Points claimed successfully!');
+      expect(mockExecuteTransaction).toHaveBeenCalledTimes(1);
+      const call = mockExecuteTransaction.mock.calls[0][0];
+      expect(call.method).toBe('claim');
+      expect(call.sourceAddress).toBe(mockPublicKey);
+      expect(toast.success).toHaveBeenCalledWith(
+        'Points claimed successfully!',
+        expect.objectContaining({ id: 'claim' })
+      );
     });
 
     it('should handle error when claiming fails', async () => {
       const error = new Error('Claim failed');
-      mockClaimPoints.mockRejectedValue(error);
+      mockExecuteTransaction.mockImplementation((opts) => {
+        opts.onStatus({ stage: 'error', error: 'Claim failed' });
+        return Promise.reject(error);
+      });
 
       const { result } = renderHook(() => useClaim(), { wrapper });
 
@@ -309,7 +430,9 @@ describe('useAccrual Hooks', () => {
       await waitFor(() => expect(result.current.isError).toBe(true));
 
       expect(result.current.error).toEqual(error);
-      expect(toast.error).toHaveBeenCalledWith('Claim failed');
+      expect(toast.error).toHaveBeenCalledWith('Claim failed: Claim failed', {
+        id: 'claim',
+      });
     });
 
     it('should throw error when wallet not connected', async () => {
@@ -326,6 +449,7 @@ describe('useAccrual Hooks', () => {
       await waitFor(() => expect(result.current.isError).toBe(true));
 
       expect(result.current.error).toEqual(new Error('Wallet not connected'));
+      expect(mockExecuteTransaction).not.toHaveBeenCalled();
     });
   });
 });
