@@ -5,9 +5,40 @@
  * Non-public vars are only accessible server-side.
  */
 
-/** Soroban RPC endpoint used for transaction simulation and submission. */
-export const SOROBAN_RPC_URL =
-  process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
+/**
+ * Soroban RPC endpoints used for transaction simulation and submission.
+ *
+ * `NEXT_PUBLIC_SOROBAN_RPC_URL` accepts a comma-separated list so the app
+ * can fail over between endpoints (#454):
+ *
+ *   NEXT_PUBLIC_SOROBAN_RPC_URL="https://soroban-testnet.stellar.org,https://backup.example.com"
+ *
+ * Whitespace around each entry is trimmed and empty entries are dropped;
+ * when nothing usable remains the public testnet default is used.
+ */
+const DEFAULT_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+const parsedRpcUrls = (
+  process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ?? DEFAULT_SOROBAN_RPC_URL
+)
+  .split(",")
+  .map((url) => url.trim())
+  .filter(Boolean);
+
+export const SOROBAN_RPC_URLS: string[] =
+  parsedRpcUrls.length > 0 ? parsedRpcUrls : [DEFAULT_SOROBAN_RPC_URL];
+
+/** Primary Soroban RPC endpoint — the first entry of {@link SOROBAN_RPC_URLS}. */
+export const SOROBAN_RPC_URL: string =
+  SOROBAN_RPC_URLS[0] ?? DEFAULT_SOROBAN_RPC_URL;
+
+/**
+ * Number of consecutive retryable failures against the active endpoint
+ * before the client fails over to the next entry in
+ * {@link SOROBAN_RPC_URLS} (#454). Defaults to 3; configure via
+ * `NEXT_PUBLIC_RPC_FAILOVER_AFTER`.
+ */
+export const RPC_FAILOVER_AFTER =
+  Number(process.env.NEXT_PUBLIC_RPC_FAILOVER_AFTER) || 3;
 
 /** Stellar network passphrase used when signing transactions. */
 export const NETWORK_PASSPHRASE =

@@ -12,9 +12,15 @@ import {
   getNetwork as freighterGetNetwork,
   signTransaction as freighterSignTransaction,
 } from "@stellar/freighter-api";
-import { BASE_FEE, SOROBAN_RPC_URL, STELLAR_NETWORK_PASSPHRASE, TX_TIMEOUT } from "./constants";
-import { withRetry } from "./rpcRetry";
-import { useWalletStore } from "@/store/walletStore";
+import {
+  BASE_FEE,
+  SOROBAN_RPC_URL,
+  SOROBAN_RPC_URLS,
+  RPC_FAILOVER_AFTER,
+  STELLAR_NETWORK_PASSPHRASE,
+  TX_TIMEOUT,
+} from "./constants";
+import { withRetry, isRetryableRpcError } from "./rpcRetry";
 
 /**
  * Multiplier applied to the assembled resource fee to add a safety buffer.
@@ -25,24 +31,112 @@ import { useWalletStore } from "@/store/walletStore";
 const FEE_MULTIPLIER = Number(process.env.NEXT_PUBLIC_FEE_MULTIPLIER) || 1.0;
 
 /**
- * Module-level singleton — created once, reused on every subsequent call.
- * Keeping a single instance avoids the overhead of re-establishing the
- * HTTP connection on every RPC call.
+ * Memoized {@link SorobanRpc.Server} instances keyed by endpoint URL, so
+ * each configured RPC URL keeps one client (and one HTTP connection pool)
+ * for the lifetime of the page (#454).
  */
-let _server: SorobanRpc.Server | null = null;
+const _servers = new Map<string, SorobanRpc.Server>();
+
+/** Index into {@link SOROBAN_RPC_URLS} of the endpoint currently in use. */
+let _activeIndex = 0;
 
 /**
- * Returns a memoized {@link SorobanRpc.Server} pointed at the configured
- * {@link SOROBAN_RPC_URL}.  The instance is created on the first call and
- * the same object is returned on every subsequent call.
+ * Consecutive retryable failures against the active endpoint. Reaches
+ * {@link RPC_FAILOVER_AFTER} → rotate to the next URL; any success resets
+ * it to zero (#454).
+ */
+let _consecutiveFailures = 0;
+
+/** The RPC endpoint currently serving calls — surfaced for the status UI. */
+export function getActiveRpcUrl(): string {
+  return SOROBAN_RPC_URLS[_activeIndex] ?? SOROBAN_RPC_URL;
+}
+
+/** Every configured RPC endpoint, in failover order (#454). */
+export function getRpcEndpoints(): readonly string[] {
+  return SOROBAN_RPC_URLS;
+}
+
+/**
+ * Reset module-level endpoint state. Test-only — keeps failover cases in
+ * one file from seeing each other's active index.
+ */
+export function __resetRpcFailoverStateForTests(): void {
+  _activeIndex = 0;
+  _consecutiveFailures = 0;
+  _servers.clear();
+}
+
+function serverFor(url: string): SorobanRpc.Server {
+  let server = _servers.get(url);
+  if (!server) {
+    server = new SorobanRpc.Server(url, {
+      allowHttp: url.startsWith("http://"),
+    });
+    _servers.set(url, server);
+  }
+  return server;
+}
+
+/**
+ * Returns a memoized {@link SorobanRpc.Server} pointed at the *active*
+ * endpoint. The instance is created on first use per URL and reused on
+ * every subsequent call. Because failover can rotate the active URL, call
+ * this (or use {@link rpcCall}) per operation rather than caching the
+ * server across a retry loop (#454).
  */
 export function getServer(): SorobanRpc.Server {
-  if (!_server) {
-    _server = new SorobanRpc.Server(SOROBAN_RPC_URL, {
-      allowHttp: SOROBAN_RPC_URL.startsWith("http://"),
-    });
+  return serverFor(getActiveRpcUrl());
+}
+
+/** Record a transient failure; rotate the endpoint once the threshold is hit. */
+function noteRpcFailure(error: unknown): void {
+  if (!isRetryableRpcError(error)) return;
+  if (SOROBAN_RPC_URLS.length <= 1) return;
+
+  _consecutiveFailures += 1;
+  if (_consecutiveFailures >= RPC_FAILOVER_AFTER) {
+    _activeIndex = (_activeIndex + 1) % SOROBAN_RPC_URLS.length;
+    _consecutiveFailures = 0;
   }
-  return _server;
+}
+
+/** A healthy response proves the active endpoint works again. */
+function noteRpcSuccess(): void {
+  _consecutiveFailures = 0;
+}
+
+/**
+ * Run an **idempotent** RPC operation with retry + failover (#454).
+ *
+ * - Each attempt resolves the server *fresh* via {@link getServer}, so a
+ *   failover triggered by an earlier attempt is picked up immediately.
+ * - Transient failures (502/503/504, rate limits, transport errors) are
+ *   retried with exponential backoff and jitter by {@link withRetry}.
+ * - After {@link RPC_FAILOVER_AFTER} consecutive transient failures the
+ *   active endpoint rotates to the next URL in `SOROBAN_RPC_URLS`.
+ * - Deterministic errors (contract rejections, wallet errors) surface
+ *   immediately without retry or failover.
+ *
+ * Never wrap `sendTransaction` in this helper — submissions are not
+ * idempotent and must be attempted exactly once (#454).
+ */
+export async function rpcCall<T>(
+  fn: (server: SorobanRpc.Server) => Promise<T>
+): Promise<T> {
+  return withRetry(
+    async () => {
+      try {
+        const result = await fn(getServer());
+        noteRpcSuccess();
+        return result;
+      } catch (error) {
+        noteRpcFailure(error);
+        throw error;
+      }
+    },
+    { idempotent: true }
+  );
 }
 
 /**
@@ -144,9 +238,8 @@ export async function simulateContractCall(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<unknown> {
-  const server = getServer();
   const contract = new Contract(contractId);
-  const account = await server.getAccount(sourceAddress);
+  const account = await rpcCall((server) => server.getAccount(sourceAddress));
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
@@ -156,7 +249,7 @@ export async function simulateContractCall(
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const result = await withRetry(() => server.simulateTransaction(tx));
+  const result = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`Simulation failed for ${method}: ${result.error}`);
@@ -194,9 +287,8 @@ export async function buildPreparedTx(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<string> {
-  const server = getServer();
   const contract = new Contract(contractId);
-  const account = await server.getAccount(sourceAddress);
+  const account = await rpcCall((server) => server.getAccount(sourceAddress));
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
@@ -206,7 +298,7 @@ export async function buildPreparedTx(
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const prepared = await withRetry(() => server.prepareTransaction(tx));
+  const prepared = await rpcCall((server) => server.prepareTransaction(tx));
 
   // Apply fee multiplier to assembled resource fee for surge buffer
   if (FEE_MULTIPLIER !== 1.0) {
@@ -527,9 +619,15 @@ export async function submitTx(signedXdr: string): Promise<unknown> {
  * recent ledger was closed. Used to compute the client-clock offset so the
  * interpolated accrual counter stays accurate even when the browser clock is
  * skewed (#492).
+ *
+ * `getLatestLedger` only returns id/sequence/protocolVersion, so we probe
+ * `getTransaction` with a hash that cannot exist: every response shape —
+ * including NOT_FOUND — carries `latestLedgerCloseTime`. Goes through
+ * {@link rpcCall} so it inherits retry + endpoint failover.
  */
 export async function getLedgerCloseTime(): Promise<number> {
-  const server = getServer();
-  const ledger = await withRetry(() => server.getLatestLedger());
-  return Number(ledger.closeTime);
+  const result = await rpcCall((server) =>
+    server.getTransaction("0".repeat(64))
+  );
+  return Number(result.latestLedgerCloseTime);
 }

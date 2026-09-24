@@ -9,6 +9,7 @@ import {
   formatPoints,
   xlmToStroops,
   stroopsToXlm,
+  stroopsToXlmString,
   BOT_TIER_NAMES,
   BOT_TIER_COLORS,
   BOT_TIER_BG_COLORS,
@@ -77,6 +78,44 @@ describe("types/index.ts Helpers (#239)", () => {
     it("converts large XLM amounts to bigints without overflow", () => {
       expect(xlmToStroops(100_000)).toBe(1_000_000_000_000n);
       expect(xlmToStroops(5_000_000)).toBe(50_000_000_000_000n);
+    });
+    it("returns 0n for invalid inputs", () => {
+      expect(xlmToStroops("")).toBe(0n);
+      expect(xlmToStroops("abc")).toBe(0n);
+      expect(xlmToStroops(NaN)).toBe(0n);
+      expect(xlmToStroops(Infinity)).toBe(0n);
+      // @ts-expect-error intentional invalid type
+      expect(xlmToStroops(null)).toBe(0n);
+    });
+
+    it("truncates fractional precision past 7 decimal places", () => {
+      // Integer part stays; the fraction is sliced to 7 digits, not rounded.
+      expect(xlmToStroops("1.12345678")).toBe(11_234_567n);
+      expect(xlmToStroops("0.00000019")).toBe(1n);
+    });
+
+    it("handles negative string amounts", () => {
+      expect(xlmToStroops("-1.5")).toBe(-15_000_000n);
+      expect(xlmToStroops("-2")).toBe(-20_000_000n);
+    });
+  });
+
+  describe("stroopsToXlmString", () => {
+    it("formats whole XLM amounts without a decimal point", () => {
+      expect(stroopsToXlmString(0n)).toBe("0");
+      expect(stroopsToXlmString(10_000_000n)).toBe("1");
+      expect(stroopsToXlmString(1_000_000_000n)).toBe("100");
+    });
+
+    it("strips trailing zeros from the fractional part", () => {
+      expect(stroopsToXlmString(15_000_000n)).toBe("1.5");
+      expect(stroopsToXlmString(1_000_000n)).toBe("0.1");
+      expect(stroopsToXlmString(1n)).toBe("0.0000001");
+    });
+
+    it("preserves the sign for negative amounts", () => {
+      expect(stroopsToXlmString(-10_000_000n)).toBe("-1");
+      expect(stroopsToXlmString(-15_000_000n)).toBe("-1.5");
     });
   });
 

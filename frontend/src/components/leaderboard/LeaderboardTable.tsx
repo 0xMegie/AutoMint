@@ -111,7 +111,6 @@ function LeaderboardCard({
   );
 }
 
-function LeaderboardTableComponent({ users, currentAddress }: LeaderboardTableProps) {
 function LeaderboardTableComponent({
   users,
   currentAddress,

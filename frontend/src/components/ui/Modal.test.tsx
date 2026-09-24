@@ -77,4 +77,44 @@ describe("Modal Component", () => {
     fireEvent.click(dialog);
     expect(handleClose).not.toHaveBeenCalled();
   });
+
+  it("wraps Tab focus from the last focusable element to the first", () => {
+    render(
+      <Modal isOpen={true} onClose={() => {}}>
+        <button type="button">Action</button>
+      </Modal>
+    );
+
+    const dialog = screen.getByRole("dialog");
+    const focusable = dialog.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    expect(focusable.length).toBeGreaterThan(1);
+
+    const last = focusable[focusable.length - 1]!;
+    last.focus();
+    expect(document.activeElement).toBe(last);
+
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(focusable[0]);
+  });
+
+  it("wraps Shift+Tab focus from the first focusable element to the last", () => {
+    render(
+      <Modal isOpen={true} onClose={() => {}}>
+        <button type="button">Action</button>
+      </Modal>
+    );
+
+    const dialog = screen.getByRole("dialog");
+    const focusable = dialog.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    first.focus();
+
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
 });

@@ -19,17 +19,71 @@ import { STALE_TIME, GC_TIME, qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
 const BASIC_BOT_RATE = 1; // Basic bot accrual rate
 const UPDATE_INTERVAL = 1000; // Update every second
 const POINTS_PER_HOUR_DIVISOR = 3600; // Seconds in an hour
+
+/** Identifiers for the three on-chain registration steps. */
+export type RegisterStepId = "register" | "mint" | "accrual";
+
+export interface RegisterStep {
+  id: RegisterStepId;
+  /** Toast/UI label for the step. */
+  label: string;
+}
+
+/**
+ * The registration pipeline, in order (#452).
+ *
+ * Exported so the banner can render a stable three-step progress UI and
+ * tests can assert which steps ran.
+ */
+export const REGISTER_STEPS: readonly RegisterStep[] = [
+  { id: "register", label: "Registering user" },
+  { id: "mint", label: "Minting basic bot" },
+  { id: "accrual", label: "Starting accrual" },
+] as const;
+
+export interface RegisterProgress {
+  /** Index into {@link REGISTER_STEPS} of the step currently running. */
+  stepIndex: number;
+  /** Running step, or `"done"` once every remaining step has confirmed. */
+  step: RegisterStepId | "done";
+}
+
 export function useRegister() {
   const queryClient = useQueryClient();
   const publicKey = useWalletStore(selectPublicKey);
+  const [progress, setProgress] = useState<RegisterProgress | null>(null);
 
-  return useMutation({
+  const mutation = useMutation({
     mutationFn: async (username: string) => {
       if (!publicKey) throw new Error("Wallet not connected");
+      setProgress(null);
 
       const REGISTRY_CONTRACT_ID = process.env.NEXT_PUBLIC_REGISTRY_CONTRACT_ID || "";
       const BOT_NFT_CONTRACT_ID = process.env.NEXT_PUBLIC_BOT_NFT_CONTRACT_ID || "";
       const ACCRUAL_CONTRACT_ID = process.env.NEXT_PUBLIC_ACCRUAL_CONTRACT_ID || "";
+
+      // Resume detection (#452): read the three on-chain facts in parallel
+      // and only run the steps that have not landed yet. A registration
+      // interrupted after step 1 (or 2) used to restart from step 1 and die
+      // on the registry's already-registered error, trapping the user.
+      const [registeredOnChain, bots, accrualState] = await Promise.all([
+        isRegistered(publicKey),
+        getUserBots(publicKey),
+        getAccrualState(publicKey),
+      ]);
+
+      const remaining = REGISTER_STEPS.filter((step) => {
+        switch (step.id) {
+          case "register":
+            return !registeredOnChain;
+          case "mint":
+            return bots.length === 0;
+          case "accrual":
+            return !accrualState;
+          default:
+            return false;
+        }
+      });
 
       // Helper to execute a transaction and handle toast updates
       const executeStep = async (
@@ -95,54 +149,67 @@ export function useRegister() {
         });
       };
 
-      // Step 1: Register user
-      await executeStep(
-        "Registering user",
-        REGISTRY_CONTRACT_ID,
-        "register",
-        [
-          nativeToScVal(publicKey, { type: "address" }),
-          nativeToScVal(username, { type: "string" }),
-        ]
-      );
+      // Steps run strictly sequentially — each executeStep awaits on-chain
+      // confirmation before the next step builds its transaction.
+      for (const step of remaining) {
+        const stepIndex = REGISTER_STEPS.findIndex((s) => s.id === step.id);
+        setProgress({ stepIndex, step: step.id });
 
-      // Step 2: Mint basic bot
-      await executeStep(
-        "Minting basic bot",
-        BOT_NFT_CONTRACT_ID,
-        "mint_basic",
-        [nativeToScVal(publicKey, { type: "address" })]
-      );
+        switch (step.id) {
+          case "register":
+            await executeStep(
+              step.label,
+              REGISTRY_CONTRACT_ID,
+              "register",
+              [
+                nativeToScVal(publicKey, { type: "address" }),
+                nativeToScVal(username, { type: "string" }),
+              ]
+            );
+            break;
+          case "mint":
+            await executeStep(
+              step.label,
+              BOT_NFT_CONTRACT_ID,
+              "mint_basic",
+              [nativeToScVal(publicKey, { type: "address" })]
+            );
+            break;
+          case "accrual":
+            await executeStep(
+              step.label,
+              ACCRUAL_CONTRACT_ID,
+              "start_accrual",
+              [
+                nativeToScVal(publicKey, { type: "address" }),
+                nativeToScVal(BASIC_BOT_RATE, { type: "u32" }),
+              ]
+            );
+            break;
+        }
+      }
 
-      // Step 3: Start accrual
-      await executeStep(
-        "Starting accrual",
-        ACCRUAL_CONTRACT_ID,
-        "start_accrual",
-        [
-          nativeToScVal(publicKey, { type: "address" }),
-          nativeToScVal(BASIC_BOT_RATE, { type: "u32" }),
-        ]
-      );
-
+      setProgress({ stepIndex: REGISTER_STEPS.length, step: "done" });
       return { success: true };
     },
     onSuccess: () => {
-      // Delayed refetch to allow blockchain state to propagate
-      setTimeout(() => {
-        queryClient.invalidateQueries({ queryKey: qk.registered(publicKey) });
-        queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
-        queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
-        queryClient.invalidateQueries({ queryKey: ["botDetails"] });
-        queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
-        queryClient.invalidateQueries({ queryKey: qk.dashboard(publicKey) });
-      }, 2000);
+      // Every step already awaited finality, so invalidate immediately —
+      // the old 2-second blind delay left the dashboard stale (#452).
+      queryClient.invalidateQueries({ queryKey: qk.registered(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
+      queryClient.invalidateQueries({ queryKey: ["botDetails"] });
+      queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.dashboard(publicKey) });
+      toast.success("Registration complete! Welcome to AutoMint!");
     },
     onError: (error: Error) => {
       // onStatus callbacks already handle error toasts
       console.error("Registration failed:", error);
     },
   });
+
+  return { ...mutation, progress };
 }
 
 /** Whether the connected wallet address is registered in the registry contract. */

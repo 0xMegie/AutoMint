@@ -83,7 +83,7 @@ function ConfirmDialog({
       document.body.style.overflow = "";
       previousFocusRef.current?.focus();
     };
-  }, [isClose, trapFocus]);
+  }, [isOpen, onClose, trapFocus]);
 
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === overlayRef.current) onClose();

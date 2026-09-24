@@ -4,7 +4,8 @@ import { useState, useMemo, useId } from "react";
 import { motion } from "framer-motion";
 import { Sparkles, User } from "lucide-react";
 import clsx from "clsx";
-import { useRegister } from "@/hooks/useAccrual";
+import { useRegister, REGISTER_STEPS } from "@/hooks/useAccrual";
+import { useWalletStore, selectNetworkMismatch } from "@/store/walletStore";
 
 interface RegistrationBannerProps {
   onRegisterSuccess?: () => void;
@@ -14,12 +15,16 @@ export default function RegistrationBanner({ onRegisterSuccess }: RegistrationBa
   const [username, setUsername] = useState("");
   const [touched, setTouched] = useState(false);
   const register = useRegister();
+  // Registering is a mutation: keep the CTA disabled while Freighter is on
+  // the wrong network (#455); executeTransaction is the runtime backstop.
+  const networkMismatch = useWalletStore(selectNetworkMismatch);
   const formId = useId();
 
   const usernameInputId = `${formId}-username`;
   const usernameHelpId = `${formId}-username-help`;
   const usernameErrorId = `${formId}-username-error`;
   const submitReasonId = `${formId}-submit-reason`;
+  const networkReasonId = `${formId}-network-reason`;
 
   // Username validation per AM-205 accessibility requirements
   const validationError = useMemo(() => {
@@ -34,10 +39,14 @@ export default function RegistrationBanner({ onRegisterSuccess }: RegistrationBa
   }, [username]);
 
   const isValid = !validationError;
+  const submitDisabled = register.isPending || !isValid || networkMismatch;
+  const progress = register.progress;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setTouched(true);
+
+    if (networkMismatch) return;
 
     if (isValid && username.trim()) {
       register.mutate(username.trim(), {
@@ -137,11 +146,55 @@ export default function RegistrationBanner({ onRegisterSuccess }: RegistrationBa
           </div>
 
           <div className="flex flex-col gap-2">
+            {register.isPending && progress && (
+              <ol
+                aria-label="Registration progress"
+                className="flex flex-col gap-1.5 rounded-xl border border-liner bg-card-2 p-3"
+              >
+                {REGISTER_STEPS.map((step, i) => {
+                  const done =
+                    progress.step === "done" || i < progress.stepIndex;
+                  const current = progress.step === step.id;
+                  return (
+                    <li
+                      key={step.id}
+                      aria-current={current ? "step" : undefined}
+                      className="flex items-center gap-2 text-sm"
+                    >
+                      <span aria-hidden="true" className="w-4 text-center">
+                        {done ? "✓" : current ? "…" : "○"}
+                      </span>
+                      <span
+                        className={clsx(
+                          current && "font-medium text-gold",
+                          done && "text-muted",
+                          !done && !current && "text-muted/60"
+                        )}
+                      >
+                        {step.label}
+                      </span>
+                        <span className="sr-only">
+                          {done
+                            ? "(done)"
+                            : current
+                              ? "(in progress)"
+                              : "(pending)"}
+                        </span>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+
             <button
               type="submit"
-              disabled={register.isPending || !isValid}
+              disabled={submitDisabled}
               aria-busy={register.isPending}
-              aria-describedby={!isValid ? submitReasonId : undefined}
+              aria-describedby={
+                [!isValid ? submitReasonId : null, networkMismatch ? networkReasonId : null]
+                  .filter(Boolean)
+                  .join(" ") || undefined
+              }
               className={clsx(
                 "flex min-h-11 items-center justify-center gap-2 rounded-xl",
                 "border border-gold/30 bg-gold/10 px-4 py-2.5",
@@ -156,6 +209,11 @@ export default function RegistrationBanner({ onRegisterSuccess }: RegistrationBa
                 <>
                   <div className="h-4 w-4 animate-spin rounded-full border-2 border-gold border-t-transparent" />
                   Registering...
+                </>
+              ) : networkMismatch ? (
+                <>
+                  <Sparkles className="h-4 w-4" aria-hidden="true" />
+                  Switch Network to Register
                 </>
               ) : (
                 <>
@@ -172,6 +230,17 @@ export default function RegistrationBanner({ onRegisterSuccess }: RegistrationBa
                 className="text-center text-xs text-muted"
               >
                 Please enter a valid username (1–32 characters) to register.
+              </p>
+            )}
+
+            {networkMismatch && (
+              <p
+                id={networkReasonId}
+                role="status"
+                className="text-center text-xs font-medium text-red-400"
+              >
+                Freighter is on the wrong network — switch to Testnet to
+                register.
               </p>
             )}
           </div>

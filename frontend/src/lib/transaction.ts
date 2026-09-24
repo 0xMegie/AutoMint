@@ -8,9 +8,9 @@ import {
   FeeBumpTransaction,
   Transaction,
 } from "@stellar/stellar-sdk";
-import { SOROBAN_RPC_URL, BASE_FEE, TX_TIMEOUT, STELLAR_NETWORK_PASSPHRASE, HORIZON_URL } from "./constants";
-import { getServer } from "./stellar";
-import { withRetry } from "./rpcRetry";
+import { BASE_FEE, TX_TIMEOUT, STELLAR_NETWORK_PASSPHRASE } from "./constants";
+import { getServer, rpcCall } from "./stellar";
+import { useWalletStore } from "@/store/walletStore";
 
 /**
  * Multiplier applied to the assembled resource fee to add a safety buffer.
@@ -36,9 +36,9 @@ export type TransactionStage =
  */
 export interface TransactionStatus {
   stage: TransactionStage;
-  hash?: string;
-  explorerUrl?: string;
-  error?: string;
+  hash?: string | undefined;
+  explorerUrl?: string | undefined;
+  error?: string | undefined;
 }
 
 /**
@@ -76,11 +76,10 @@ function getSequenceTracker(address: string): SequenceTracker {
  */
 async function getNextSequenceNumber(address: string): Promise<number> {
   const tracker = getSequenceTracker(address);
-  const server = getServer();
 
-  // First call: read from RPC
+  // First call: read from RPC (idempotent — retried / failed over via rpcCall)
   if (tracker.current === -1) {
-    const account = await server.getAccount(address);
+    const account = await rpcCall((server) => server.getAccount(address));
     tracker.current = parseInt(account.sequenceNumber(), 10);
     tracker.pending = tracker.current + 1;
   } else {
@@ -106,12 +105,10 @@ function reconcileSequence(address: string, confirmedSequence: number): void {
  * Refreshes the account sequence number and re-attempts once.
  */
 async function retryOnBadSeq(
-  fn: () => Promise<SorobanRpc.SendTransactionResponse>,
+  fn: () => Promise<SorobanRpc.Api.SendTransactionResponse>,
   address: string,
   onStatus: (status: TransactionStatus) => void
-): Promise<SorobanRpc.SendTransactionResponse> {
-  const server = getServer();
-
+): Promise<SorobanRpc.Api.SendTransactionResponse> {
   try {
     return await fn();
   } catch (err) {
@@ -125,12 +122,15 @@ async function retryOnBadSeq(
       });
 
       // Refresh account and reset sequence tracker
-      const account = await server.getAccount(address);
+      const account = await rpcCall((server) => server.getAccount(address));
       const tracker = getSequenceTracker(address);
       tracker.current = parseInt(account.sequenceNumber(), 10);
       tracker.pending = tracker.current + 1;
 
-      // Retry once
+      // Retry once — txBAD_SEQ is deterministic (the tx did NOT land), so a
+      // single resubmit with the fresh sequence is safe. Transient RPC
+      // failures are never retried here (#454: sendTransaction is never
+      // automatically retried).
       return fn();
     }
 
@@ -152,7 +152,8 @@ async function queueTransaction<T>(
   }
 
   const queue = transactionQueues.get(address)!;
-  const promise = queue.length === 0 ? Promise.resolve() : queue[queue.length - 1];
+  const promise: Promise<unknown> =
+    queue[queue.length - 1] ?? Promise.resolve();
 
   const result = promise.then(() => fn()).catch((err) => {
     // Keep queue moving even on error
@@ -161,13 +162,17 @@ async function queueTransaction<T>(
 
   queue.push(result);
 
-  // Clean up completed promises to avoid memory leak
-  result.finally(() => {
-    const idx = queue.indexOf(result);
-    if (idx >= 0) {
-      queue.splice(idx, 1);
-    }
-  });
+  // Clean up completed promises to avoid memory leak. The .finally chain
+  // re-rejects, so swallow on this side branch — the real rejection is
+  // still delivered to the caller via `result`.
+  result
+    .finally(() => {
+      const idx = queue.indexOf(result);
+      if (idx >= 0) {
+        queue.splice(idx, 1);
+      }
+    })
+    .catch(() => {});
 
   return result;
 }
@@ -223,10 +228,18 @@ export async function executeTransaction({
   sourceAddress: string;
   onStatus: (status: TransactionStatus) => void;
 }): Promise<unknown> {
-  const server = getServer();
   let txHash: string = "";
 
   try {
+    // Refuse to build anything while Freighter is on the wrong network
+    // (#455): the payload would be signed under a passphrase this app never
+    // intended. The flag is kept in the store by the banner's network poll.
+    if (useWalletStore.getState().networkMismatch) {
+      throw new Error(
+        "Freighter is connected to the wrong network. Switch to Testnet and try again."
+      );
+    }
+
     // 1. Build the contract invocation
     onStatus({ stage: "building" });
     const contract = new Contract(contractId);
@@ -236,7 +249,7 @@ export async function executeTransaction({
       getNextSequenceNumber(sourceAddress)
     );
 
-    const account = await server.getAccount(sourceAddress);
+    const account = await rpcCall((server) => server.getAccount(sourceAddress));
     // Override sequence number to match our client-side tracker
     // This prevents txBAD_SEQ when submitting consecutive transactions
     account.sequenceNumber = () => String(sequenceNum);
@@ -251,7 +264,7 @@ export async function executeTransaction({
 
     // 2. Prepare (assemble) the final transaction with resource fees
     onStatus({ stage: "assembling" });
-    const prepared = await withRetry(() => server.prepareTransaction(tx));
+    const prepared = await rpcCall((server) => server.prepareTransaction(tx));
 
     // Apply fee multiplier after assembly
     if (FEE_MULTIPLIER !== 1.0) {
@@ -266,11 +279,19 @@ export async function executeTransaction({
     onStatus({ stage: "signing" });
     const signedXdr = await signTransaction(assembledTx, sourceAddress);
 
-    // 5. Submit to RPC (serialized per account)
+    // 5. Submit to RPC (serialized per account). sendTransaction is NOT
+    // retried automatically (#454): a submission may have landed even if
+    // the RPC reported an error, and the endpoint is resolved fresh at
+    // submit time so an in-flow failover is picked up.
     onStatus({ stage: "submitting" });
     const submitResult = await queueTransaction(sourceAddress, () =>
       retryOnBadSeq(
-        () => server.sendTransaction(signedXdr),
+        // sendTransaction takes a Transaction object in this SDK — rehydrate
+        // the signed XDR before handing it over.
+        () =>
+          getServer().sendTransaction(
+            TransactionBuilder.fromXDR(signedXdr, STELLAR_NETWORK_PASSPHRASE)
+          ),
         sourceAddress,
         onStatus
       )
@@ -279,7 +300,11 @@ export async function executeTransaction({
     txHash = submitResult.hash;
 
     if (submitResult.status === "ERROR") {
-      throw new Error(`Transaction submission failed: ${submitResult.errorResultXdr}`);
+      // errorResult is a parsed xdr.TransactionResult — the raw XDR field
+      // (errorResultXdr) only exists on the unparsed response shape.
+      throw new Error(
+        "Transaction submission failed — the network rejected the transaction."
+      );
     }
 
     // 6. Poll for confirmation
@@ -289,7 +314,7 @@ export async function executeTransaction({
       explorerUrl: getExplorerUrl(txHash),
     });
 
-    const pollResult = await pollTransaction(server, txHash, sourceAddress);
+    const pollResult = await pollTransaction(txHash, sourceAddress);
 
     if (pollResult.status === "FAILED") {
       throw new Error(`Transaction failed on-chain: ${pollResult.error || "unknown error"}`);
@@ -335,22 +360,52 @@ async function signTransaction(
 ): Promise<string> {
   // Dynamically import Freighter API
   const freighter = await import("@stellar/freighter-api");
-  const sign = freighter.sign || (freighter as any).default?.sign;
+  // freigther-api v3 exports signTransaction (not sign) and returns
+  // signedTxXdr (not signedTransaction).
+  const sign =
+    freighter.signTransaction ||
+    (freighter as any).default?.signTransaction;
 
   if (!sign) {
-    throw new Error("Freighter API sign not available");
+    throw new Error("Freighter API signTransaction not available");
   }
 
-  const result = await sign({
-    transactionXDR: tx.toXDR(),
+  // Re-check the LIVE wallet network immediately before requesting the
+  // signature (#455): Freighter can be switched between the store-level
+  // check and here. Fail closed on any error — we never sign a payload we
+  // could not verify the destination network for.
+  let livePassphrase: string;
+  try {
+    const network = await freighter.getNetwork();
+    if (network?.error) {
+      throw new Error(network.error.message || "Could not read wallet network");
+    }
+    livePassphrase = network.networkPassphrase;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Could not verify wallet network before signing: ${msg}`);
+  }
+
+  if (livePassphrase !== STELLAR_NETWORK_PASSPHRASE) {
+    useWalletStore.getState().setNetworkMismatch(true);
+    throw new Error(
+      "Freighter is connected to the wrong network. Switch to Testnet and try again."
+    );
+  }
+  // Network is correct: clear any stale mismatch flag so the banner and
+  // disabled buttons recover without a reload.
+  useWalletStore.getState().setNetworkMismatch(false);
+
+  const result = await sign(tx.toXDR(), {
     networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+    address: _sourceAddress,
   });
 
   if (result.error) {
     throw new Error(result.error.message || "Failed to sign transaction");
   }
 
-  const signedXdr = result.signedTransaction || (result as any).signedXDR;
+  const signedXdr = result.signedTxXdr;
   if (!signedXdr) {
     throw new Error("No signed transaction returned from wallet");
   }
@@ -365,12 +420,31 @@ async function signTransaction(
 interface PollResult {
   status: "SUCCESS" | "FAILED" | "TIMEOUT";
   returnValue?: unknown;
-  sequenceNumber?: number;
-  error?: string;
+  sequenceNumber?: number | undefined;
+  error?: string | undefined;
+}
+
+/**
+ * Extract the account sequence number from a confirmed transaction's
+ * envelope so the local tracker can be reconciled after success.
+ */
+function sequenceFromEnvelope(
+  envelope: xdr.TransactionEnvelope
+): number | undefined {
+  try {
+    if (envelope.switch() === xdr.EnvelopeType.envelopeTypeTx()) {
+      return Number(envelope.v1().tx().seqNum());
+    }
+    if (envelope.switch() === xdr.EnvelopeType.envelopeTypeTxFeeBump()) {
+      return Number(envelope.feeBump().tx().innerTx().v1().tx().seqNum());
+    }
+  } catch {
+    // Malformed/unexpected envelope — leave the tracker untouched.
+  }
+  return undefined;
 }
 
 async function pollTransaction(
-  server: SorobanRpc.Server,
   txHash: string,
   _sourceAddress: string
 ): Promise<PollResult> {
@@ -380,7 +454,9 @@ async function pollTransaction(
 
   while (Date.now() - startTime < maxWaitMs) {
     try {
-      const result = await server.getTransaction(txHash);
+      // Idempotent read: retried / failed over by rpcCall; a transient
+      // error here just falls through to the next poll interval.
+      const result = await rpcCall((server) => server.getTransaction(txHash));
 
       if (result.status === "SUCCESS") {
         // Decode return value if present (it's an XDR ScVal)
@@ -396,16 +472,16 @@ async function pollTransaction(
         return {
           status: "SUCCESS",
           returnValue,
-          sequenceNumber: result.sequenceNumber
-            ? parseInt(result.sequenceNumber, 10)
-            : undefined,
+          sequenceNumber: sequenceFromEnvelope(result.envelopeXdr),
         };
       }
 
       if (result.status === "FAILED") {
         return {
           status: "FAILED",
-          error: result.resultXdr || "Contract execution failed",
+          // resultXdr is a parsed xdr.TransactionResult object — a generic
+          // message beats stringifying it to "[object Object]".
+          error: "Contract execution failed",
         };
       }
 
