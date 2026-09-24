@@ -37,12 +37,29 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
       - name: cargo build wasm
-        run: cargo build --target wasm32v1-none --release
+        run: cargo build --target wasm32v1-none --release -p automint-registry -p automint-token -p automint-bot-nft -p automint-accrual -p automint-marketplace
       - name: Upload wasm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wasm-artifacts
           path: target/wasm32v1-none/release/*.wasm
+
+  bindings-drift:
+    name: Bindings drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install Stellar CLI
+        run: cargo install stellar-cli --locked --version 22.0.0 || cargo install stellar-cli --locked
+      - name: Generate bindings
+        run: bash scripts/generate-bindings.sh
+      - name: Fail on drift
+        run: git diff --exit-code -- frontend/src/lib/bindings/
 
   frontend:
     name: Frontend (lint, type-check)

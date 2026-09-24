@@ -739,11 +739,15 @@ fn test_next_listing_id_starts_at_one_and_increments() {
     assert_eq!(h.mkt.next_listing_id(), 1);
     let seller = Address::generate(&h.env);
     let id1 = h.bot.mint_basic(&seller);
-    let l1 = h.mkt.list_bot(&seller, &id1, &50_0000000_i128, &h.token.address);
+    let l1 = h
+        .mkt
+        .list_bot(&seller, &id1, &50_0000000_i128, &h.token.address);
     assert_eq!(l1, 1);
     assert_eq!(h.mkt.next_listing_id(), 2);
     let id2 = h.bot.mint_basic(&seller);
-    let l2 = h.mkt.list_bot(&seller, &id2, &50_0000000_i128, &h.token.address);
+    let l2 = h
+        .mkt
+        .list_bot(&seller, &id2, &50_0000000_i128, &h.token.address);
     assert_eq!(l2, 2);
     assert_eq!(h.mkt.next_listing_id(), 3);
 }
@@ -755,7 +759,9 @@ fn test_get_listing_historical_remains_readable_after_buy_and_cancel() {
     let buyer = Address::generate(&h.env);
     h.token.mint(&buyer, &1000_0000000_i128);
     let bot1 = h.bot.mint_basic(&seller);
-    let l1 = h.mkt.list_bot(&seller, &bot1, &100_0000000_i128, &h.token.address);
+    let l1 = h
+        .mkt
+        .list_bot(&seller, &bot1, &100_0000000_i128, &h.token.address);
     h.mkt.buy_bot(&buyer, &l1);
     let hist1 = h.mkt.get_listing(&l1);
     assert!(!hist1.active);
@@ -765,7 +771,9 @@ fn test_get_listing_historical_remains_readable_after_buy_and_cancel() {
         Err(Ok(MarketplaceError::ListingNotFound))
     );
     let bot2 = h.bot.mint_basic(&seller);
-    let l2 = h.mkt.list_bot(&seller, &bot2, &100_0000000_i128, &h.token.address);
+    let l2 = h
+        .mkt
+        .list_bot(&seller, &bot2, &100_0000000_i128, &h.token.address);
     h.mkt.cancel_listing(&seller, &l2);
     let hist2 = h.mkt.get_listing(&l2);
     assert!(!hist2.active);
@@ -780,7 +788,12 @@ fn test_min_price_default_guarantees_fee_at_least_one() {
     let default_min = h.mkt.get_min_price(&h.token.address);
     assert_eq!(default_min, 40);
     let fee = default_min * 250 / 10_000;
-    assert!(fee >= 1, "fee {} should be >=1 for default min {}", fee, default_min);
+    assert!(
+        fee >= 1,
+        "fee {} should be >=1 for default min {}",
+        fee,
+        default_min
+    );
 }
 
 #[test]
@@ -789,16 +802,20 @@ fn test_price_below_min_fails_with_price_too_low() {
     let seller = Address::generate(&h.env);
     let bot_id = h.bot.mint_basic(&seller);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot_id, &39_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot_id, &39_i128, &h.token.address),
         Err(Ok(MarketplaceError::PriceTooLow))
     );
     let bot2 = h.bot.mint_basic(&seller);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot2, &1_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot2, &1_i128, &h.token.address),
         Err(Ok(MarketplaceError::PriceTooLow))
     );
     let bot3 = h.bot.mint_basic(&seller);
-    let res = h.mkt.try_list_bot(&seller, &bot3, &40_i128, &h.token.address);
+    let res = h
+        .mkt
+        .try_list_bot(&seller, &bot3, &40_i128, &h.token.address);
     assert!(res.is_ok(), "price == min should succeed, got {:?}", res);
 }
 
@@ -826,7 +843,10 @@ fn test_min_price_per_currency_admin_settable() {
         Err(Ok(MarketplaceError::PriceTooLow))
     );
     let bot4 = h.bot.mint_basic(&seller);
-    assert!(h.mkt.try_list_bot(&seller, &bot4, &6000_i128, &currency_b).is_ok());
+    assert!(h
+        .mkt
+        .try_list_bot(&seller, &bot4, &6000_i128, &currency_b)
+        .is_ok());
 }
 
 #[test]
@@ -845,7 +865,12 @@ fn test_fee_always_at_least_one_for_any_accepted_price() {
         let admin_before = h.token.balance(&h.admin);
         h.mkt.buy_bot(&buyer, &listing);
         let fee_paid = h.token.balance(&h.admin) - admin_before;
-        assert!(fee_paid >= 1, "fee paid {} for price {} should be >=1", fee_paid, price);
+        assert!(
+            fee_paid >= 1,
+            "fee paid {} for price {} should be >=1",
+            fee_paid,
+            price
+        );
     }
 }
 
@@ -868,7 +893,11 @@ fn test_fee_bps_change_updates_default_min_price() {
     let custom_cur = Address::generate(&h.env);
     h.mkt.set_min_price(&custom_cur, &1000_i128);
     h.mkt.set_fee_bps(&1000u32);
-    assert_eq!(h.mkt.get_min_price(&custom_cur), 1000, "custom floor must not change");
+    assert_eq!(
+        h.mkt.get_min_price(&custom_cur),
+        1000,
+        "custom floor must not change"
+    );
     assert_eq!(h.mkt.get_min_price(&currency), 10);
 }
 
@@ -913,7 +942,8 @@ fn test_fee_boundary_prices() {
     let buyer = Address::generate(&h.env);
     let bot_dust = h.bot.mint_basic(&seller);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot_dust, &39_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot_dust, &39_i128, &h.token.address),
         Err(Ok(MarketplaceError::PriceTooLow))
     );
     let bot_ok = h.bot.mint_basic(&seller);
@@ -926,7 +956,9 @@ fn test_fee_boundary_prices() {
     let buyer2 = Address::generate(&h.env);
     h.token.mint(&buyer2, &i128::MAX);
     let bot_big = h.bot.mint_basic(&seller2);
-    let l_big = h.mkt.list_bot(&seller2, &bot_big, &i128::MAX, &h.token.address);
+    let l_big = h
+        .mkt
+        .list_bot(&seller2, &bot_big, &i128::MAX, &h.token.address);
     let res = h.mkt.try_buy_bot(&buyer2, &l_big);
     assert_eq!(res, Err(Ok(MarketplaceError::Overflow)));
 }
@@ -950,7 +982,11 @@ fn test_buyer_exactly_enough_and_one_short() {
     h.token.mint(&buyer_short, &(price - 1));
     let res_short = h.mkt.try_buy_bot(&buyer_short, &l2);
     assert_eq!(res_short, Err(Ok(MarketplaceError::PaymentFailed)));
-    assert_eq!(h.token.balance(&buyer_short), price - 1, "balance unchanged on payment failure");
+    assert_eq!(
+        h.token.balance(&buyer_short),
+        price - 1,
+        "balance unchanged on payment failure"
+    );
     assert!(h.mkt.get_listing(&l2).active);
 }
 
@@ -962,7 +998,9 @@ fn test_self_purchase_fails_with_self_purchase_error() {
     let seller = Address::generate(&h.env);
     h.token.mint(&seller, &100_0000000_i128);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     assert_eq!(
         h.mkt.try_buy_bot(&seller, &l),
         Err(Ok(MarketplaceError::SelfPurchase))
@@ -1119,7 +1157,8 @@ fn test_error_variant_invalid_price() {
     );
     let bot2 = h.bot.mint_basic(&seller);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot2, &-5_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot2, &-5_i128, &h.token.address),
         Err(Ok(MarketplaceError::InvalidPrice))
     );
 }
@@ -1130,7 +1169,8 @@ fn test_error_variant_price_too_low() {
     let seller = Address::generate(&h.env);
     let bot = h.bot.mint_basic(&seller);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot, &10_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot, &10_i128, &h.token.address),
         Err(Ok(MarketplaceError::PriceTooLow))
     );
 }
@@ -1140,13 +1180,15 @@ fn test_error_variant_bot_transfer_failed() {
     let h = setup();
     let seller = Address::generate(&h.env);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &9999_u64, &100_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &9999_u64, &100_i128, &h.token.address),
         Err(Ok(MarketplaceError::BotTransferFailed))
     );
     let owner = Address::generate(&h.env);
     let bot = h.bot.mint_basic(&owner);
     assert_eq!(
-        h.mkt.try_list_bot(&seller, &bot, &100_i128, &h.token.address),
+        h.mkt
+            .try_list_bot(&seller, &bot, &100_i128, &h.token.address),
         Err(Ok(MarketplaceError::BotTransferFailed))
     );
 }
@@ -1177,7 +1219,9 @@ fn test_error_variant_listing_not_active() {
     let buyer = Address::generate(&h.env);
     h.token.mint(&buyer, &100_0000000_i128);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     h.mkt.cancel_listing(&seller, &l);
     assert_eq!(
         h.mkt.try_buy_bot(&buyer, &l),
@@ -1202,7 +1246,9 @@ fn test_error_variant_unauthorized() {
     let seller = Address::generate(&h.env);
     let stranger = Address::generate(&h.env);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     assert_eq!(
         h.mkt.try_cancel_listing(&stranger, &l),
         Err(Ok(MarketplaceError::Unauthorized))
@@ -1215,7 +1261,9 @@ fn test_error_variant_self_purchase() {
     let seller = Address::generate(&h.env);
     h.token.mint(&seller, &100_0000000_i128);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     assert_eq!(
         h.mkt.try_buy_bot(&seller, &l),
         Err(Ok(MarketplaceError::SelfPurchase))
@@ -1228,7 +1276,9 @@ fn test_error_variant_payment_failed() {
     let seller = Address::generate(&h.env);
     let buyer = Address::generate(&h.env);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     assert_eq!(
         h.mkt.try_buy_bot(&buyer, &l),
         Err(Ok(MarketplaceError::PaymentFailed))
@@ -1256,7 +1306,9 @@ fn test_error_variant_listing_stale() {
     let buyer = Address::generate(&h.env);
     h.token.mint(&buyer, &100_0000000_i128);
     let bot = h.bot.mint_basic(&seller);
-    let l = h.mkt.list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
+    let l = h
+        .mkt
+        .list_bot(&seller, &bot, &100_0000000_i128, &h.token.address);
     h.bot.transfer(&bot, &h.mkt.address, &seller);
     assert_eq!(
         h.mkt.try_buy_bot(&buyer, &l),
@@ -1331,11 +1383,13 @@ fn test_e2e_five_contract_full_flow() {
     assert_eq!(bot.get_user_bots(&bob).len(), 1, "bob should own 1 bot");
     // Registry bot_count is incremented via bot_nft → registry cross-call.
     assert_eq!(
-        registry.get_user(&alice).bot_count, 1,
+        registry.get_user(&alice).bot_count,
+        1,
         "registry bot_count for alice should be 1 (AM-003)"
     );
     assert_eq!(
-        registry.get_user(&bob).bot_count, 1,
+        registry.get_user(&bob).bot_count,
+        1,
         "registry bot_count for bob should be 1 (AM-003)"
     );
     // Bot tier and rate sanity.
@@ -1343,8 +1397,16 @@ fn test_e2e_five_contract_full_flow() {
     assert_eq!(bot.get_bot(&bob_basic_id).tier, BotTier::Basic);
     // Basic effective rate is always 1 (bonus <1 for base 1).
     assert_eq!(bot.get_bot(&alice_basic_id).accrual_rate, 1);
-    assert_eq!(bot.get_user_total_rate(&alice), 1, "alice total rate should be 1");
-    assert_eq!(bot.get_user_total_rate(&bob), 1, "bob total rate should be 1");
+    assert_eq!(
+        bot.get_user_total_rate(&alice),
+        1,
+        "alice total rate should be 1"
+    );
+    assert_eq!(
+        bot.get_user_total_rate(&bob),
+        1,
+        "bob total rate should be 1"
+    );
 
     // 3. Start accrual for both users.
     // Use a high rate (3600) so 1 hour yields 3600 points → 36 AMT, making
@@ -1355,13 +1417,19 @@ fn test_e2e_five_contract_full_flow() {
     accrual.start_accrual(&bob, &accrual_rate);
 
     // Invariants 8-9: accrual state initialized correctly.
-    let alice_state = accrual.get_accrual_state(&alice).expect("alice accrual state");
+    let alice_state = accrual
+        .get_accrual_state(&alice)
+        .expect("alice accrual state");
     assert_eq!(alice_state.total_claimed_points, 0);
     // last_claim_ts should equal current ledger timestamp at start.
     assert_eq!(alice_state.last_claim_ts, env.ledger().timestamp());
     let bob_state = accrual.get_accrual_state(&bob).expect("bob accrual state");
     assert_eq!(bob_state.last_claim_ts, env.ledger().timestamp());
-    assert_eq!(accrual.pending_points(&alice), 0, "pending at t=0 should be 0");
+    assert_eq!(
+        accrual.pending_points(&alice),
+        0,
+        "pending at t=0 should be 0"
+    );
 
     // 4. Advance time by 1 hour (3600s) and claim.
     env.ledger().with_mut(|li| {
@@ -1389,7 +1457,11 @@ fn test_e2e_five_contract_full_flow() {
         36,
         "alice should have 36 AMT after first claim (3600/100)"
     );
-    assert_eq!(token.balance(&bob), 36, "bob should have 36 AMT after first claim");
+    assert_eq!(
+        token.balance(&bob),
+        36,
+        "bob should have 36 AMT after first claim"
+    );
     assert_eq!(
         accrual.pending_points(&alice),
         0,
@@ -1409,7 +1481,10 @@ fn test_e2e_five_contract_full_flow() {
     assert_eq!(bob_profile.claimed_amt, 36);
     // Accrual state carry is 0 because 3600 %100==0.
     assert_eq!(
-        accrual.get_accrual_state(&alice).unwrap().total_claimed_points,
+        accrual
+            .get_accrual_state(&alice)
+            .unwrap()
+            .total_claimed_points,
         0
     );
 
@@ -1439,7 +1514,8 @@ fn test_e2e_five_contract_full_flow() {
     );
     // Registry bot_count should now be 2 for alice.
     assert_eq!(
-        registry.get_user(&alice).bot_count, 2,
+        registry.get_user(&alice).bot_count,
+        2,
         "alice bot_count should be 2 after Gold mint"
     );
     assert_eq!(bot.get_user_bots(&alice).len(), 2);
@@ -1461,7 +1537,11 @@ fn test_e2e_five_contract_full_flow() {
         marketplace.address,
         "Gold bot should be escrowed to marketplace after list"
     );
-    assert_eq!(bot.get_user_bots(&alice).len(), 1, "alice should have 1 bot after escrow (basic only)");
+    assert_eq!(
+        bot.get_user_bots(&alice).len(),
+        1,
+        "alice should have 1 bot after escrow (basic only)"
+    );
     let listing = marketplace.get_listing(&listing_id);
     assert!(listing.active, "listing should be active");
     assert_eq!(listing.seller, alice);
@@ -1475,7 +1555,11 @@ fn test_e2e_five_contract_full_flow() {
     let bob_bal_before = token.balance(&bob);
     let alice_bal_before = token.balance(&alice);
     let admin_bal_before = token.balance(&admin);
-    assert_eq!(bob_bal_before, 36 + price, "bob should be funded to price + claim");
+    assert_eq!(
+        bob_bal_before,
+        36 + price,
+        "bob should be funded to price + claim"
+    );
     // Invariant: Bob's token balance before buy is sufficient.
 
     // 7. Bob buys the Gold bot from Alice.
@@ -1529,11 +1613,13 @@ fn test_e2e_five_contract_full_flow() {
 
     // Registry bot_counts unchanged by marketplace transfer (only mint increments).
     assert_eq!(
-        registry.get_user(&alice).bot_count, 2,
+        registry.get_user(&alice).bot_count,
+        2,
         "alice registry bot_count stays 2 after sale (mint only)"
     );
     assert_eq!(
-        registry.get_user(&bob).bot_count, 1,
+        registry.get_user(&bob).bot_count,
+        1,
         "bob registry bot_count stays 1 after buy (buy does not increment)"
     );
 

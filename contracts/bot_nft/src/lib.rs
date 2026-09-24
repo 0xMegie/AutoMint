@@ -741,7 +741,10 @@ mod test {
         assert_eq!(detailed.len(), 2);
         assert_eq!(detailed.get(0).map(|bot| bot.id), Some(id1));
         assert_eq!(detailed.get(1).map(|bot| bot.id), Some(id2));
-        assert_eq!(detailed.get(0).map(|bot| bot.owner.clone()), Some(user.clone()));
+        assert_eq!(
+            detailed.get(0).map(|bot| bot.owner.clone()),
+            Some(user.clone())
+        );
     }
 
     #[test]

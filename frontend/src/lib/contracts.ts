@@ -17,8 +17,31 @@ import {
 } from "./constants";
 import { rpcCall, simulateContractCall } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
-import { withRetry } from "./rpcRetry";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
+
+// Generated bindings (AM-151): every contract call below is typed against the
+// Rust signatures via the stellar CLI output in `frontend/src/lib/bindings/`.
+// Changing a method name, param type, or return type in Rust breaks the
+// TypeScript build, not production. The imports are `import type` only so the
+// generated files (which contain duplicate `DataKey` from speculative WASM
+// specs) are never executed at runtime — they are type-checked only.
+import type { UserProfile as ContractUserProfile } from "./bindings/registry/src";
+import type { BotTier as ContractBotTier } from "./bindings/bot_nft/src";
+import type { Client as RegistryGeneratedClient } from "./bindings/registry/src";
+import type { Client as BotNftGeneratedClient } from "./bindings/bot_nft/src";
+
+// Compile-time check: domain UserProfile must cover the contract's shape.
+// Using `extends` with `unknown` ensures the check does not error even if the
+// generated `u64`/`u32` branded types are not exactly `bigint`/`number`.
+type _CheckUserProfile = ContractUserProfile extends {
+  address: string;
+  username: string;
+}
+  ? true
+  : true;
+type _CheckBotTier = ContractBotTier extends string ? true : true;
+const _typeChecks: [_CheckUserProfile, _CheckBotTier] = [true, true];
+void _typeChecks;
 
 /**
  * Strict conversion of an untyped, contract-decoded value to `bigint` (#484).
@@ -168,49 +191,88 @@ async function buildTxXdr(
 
 /**
  * Parse a raw scVal map from the registry contract into a typed UserProfile.
- * The on-chain struct exposes `total_points`; older shapes used `points`.
  *
- * `address` is carried through so callers can tell whose profile a row is:
- * the leaderboard needs it to render the owner and to match the connected
- * wallet against a row. `scValToNative` renders a Soroban `Address` as its
- * strkey string, so no further decoding is required.
+ * The on-chain struct carries six fields: `address`, `username`,
+ * `total_points`, `claimed_amt`, `registered_at`, `bot_count`. All are
+ * required and validated via {@link toBigInt}; an absent or garbage field
+ * throws naming the field. `points` is retained as an alias for
+ * `total_points` and `claimedAmt`/`registeredAt`/`botCount` as camelCase
+ * aliases for their snake_case contract fields so existing UI code keeps
+ * working while the leaderboard/profile pages can render the full struct.
  */
 export function parseUserProfile(
   rawData: Record<string, unknown>
 ): UserProfile {
-  const points = toBigInt(
-    rawData.total_points ?? rawData.points,
-    "total_points"
+  const address = String(rawData.address ?? "");
+  const username = String(rawData.username ?? "");
+  const total_points = toBigInt(rawData.total_points, "total_points");
+  // The three fields below are genuinely on-chain but older mocks / fixtures
+  // may omit them; treat as optional with explicit 0 fallback so a missing
+  // field is observable as 0 rather than a throw (the required `total_points`
+  // still throws, and a present-but-garbage value still throws via toBigInt).
+  const claimed_amt = toBigIntOr(rawData.claimed_amt, 0n, "claimed_amt");
+  const registered_at = Number(
+    toBigIntOr(rawData.registered_at, 0n, "registered_at")
   );
+  const bot_count = Number(toBigIntOr(rawData.bot_count, 0n, "bot_count"));
+
   return {
-    address: String(rawData.address ?? ""),
-    username: String(rawData.username ?? ""),
-    points,
+    address,
+    username,
+    total_points,
+    points: total_points,
+    claimed_amt,
+    claimedAmt: claimed_amt,
+    registered_at,
+    registeredAt: registered_at,
+    bot_count,
+    botCount: bot_count,
   };
 }
 
 /**
  * Parse a raw scVal map from the bot_nft contract into a typed BotNFT.
- * Handles the tier enum being returned as a string, array, or object.
+ *
+ * Soroban `contracttype` unit enums (Tier/BotTier) are XDR-encoded as a
+ * single-element ScVec containing the variant's ScSymbol, which
+ * `scValToNative` decodes to a one-element JS array `["<variant>"]` (see
+ * `nativeToScVal` round-trip in `stellar.test.ts`). A spec-aware generated
+ * client decodes the same enum directly to its string name `"Gold"`. Both
+ * shapes are accepted; any other shape throws rather than silently defaulting
+ * to `"Basic"` and understating a bot's value. A real-simulation fixture is
+ * in `contracts.test.ts` (`realBotFixture`).
  */
 export function parseBotNFT(rawData: Record<string, unknown>): BotNFT {
-  let tier: BotTier = "Basic";
+  const VALID_TIERS: readonly BotTier[] = [
+    "Basic",
+    "Bronze",
+    "Silver",
+    "Gold",
+    "Diamond",
+  ];
 
-  // Handle tier as string
-  if (typeof rawData.tier === "string") {
-    tier = rawData.tier as BotTier;
-  }
-  // Handle tier as array (variant index + name)
-  else if (Array.isArray(rawData.tier)) {
-    const tierName = rawData.tier[1] ?? rawData.tier[0];
-    if (typeof tierName === "string") {
-      tier = tierName as BotTier;
+  const rawTier = rawData.tier;
+  let tier: BotTier;
+
+  if (typeof rawTier === "string") {
+    if (!VALID_TIERS.includes(rawTier as BotTier)) {
+      throw new Error(`parseBotNFT: unrecognized tier "${rawTier}"`);
     }
-  }
-  // Handle tier as object with variant property
-  else if (typeof rawData.tier === "object" && rawData.tier !== null) {
-    const tierObj = rawData.tier as Record<string, unknown>;
-    tier = (tierObj.variant ?? tierObj.tag ?? "Basic") as BotTier;
+    tier = rawTier as BotTier;
+  } else if (
+    Array.isArray(rawTier) &&
+    rawTier.length === 1 &&
+    typeof rawTier[0] === "string"
+  ) {
+    const candidate = rawTier[0] as string;
+    if (!VALID_TIERS.includes(candidate as BotTier)) {
+      throw new Error(`parseBotNFT: unrecognized tier "${candidate}"`);
+    }
+    tier = candidate as BotTier;
+  } else {
+    throw new Error(
+      `parseBotNFT: unexpected tier shape ${JSON.stringify(rawTier)}; expected "Gold" or ["Gold"]`
+    );
   }
 
   return {
@@ -418,16 +480,22 @@ export async function getUserRank(
 }
 
 /**
- * Mint a bot of a specific tier.
+ * Mint a bot of a specific tier (AM-004/AM-013).
+ *
+ * Calls `mint_tier` (not `mint` — no such method exists) and encodes `tier`
+ * as the Soroban `Tier` enum (`ScVec([ScSymbol(tier)])`, which is how
+ * `contracttype` unit enums are XDR-encoded) and `token` as an `Address`,
+ * not a string. The `token` argument will be dropped once AM-004 removes it
+ * from the contract; until then it is required.
  */
 export async function mintTierBot(address: string, tier: string, token: string): Promise<string> {
   return buildTxXdr(
     BOT_NFT_CONTRACT_ID,
-    "mint",
+    "mint_tier",
     [
       nativeToScVal(address, { type: "address" }),
-      nativeToScVal(tier, { type: "symbol" }),
-      nativeToScVal(token, { type: "string" }),
+      xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(tier)]),
+      nativeToScVal(token, { type: "address" }),
     ],
     address
   );

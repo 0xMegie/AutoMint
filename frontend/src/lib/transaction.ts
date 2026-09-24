@@ -316,7 +316,7 @@ async function executeTransactionInternal(
 
   // Initialize sequence tracking on first transaction for this account
   if (sequenceState.current === 0) {
-    sequenceState.current = account.sequenceNumber();
+    sequenceState.current = Number(account.sequenceNumber());
   }
 
   const tx = new TransactionBuilder(account, {
@@ -402,7 +402,7 @@ async function executeTransactionInternal(
       const refreshedAccount = await rpcCall((server) =>
         server.getAccount(sourceAddress)
       );
-      sequenceState.current = refreshedAccount.sequenceNumber();
+      sequenceState.current = Number(refreshedAccount.sequenceNumber());
       sequenceState.pending = sequenceState.current + 1;
 
       onStatus?.({ stage: "building" });

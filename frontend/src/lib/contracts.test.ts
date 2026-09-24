@@ -8,11 +8,14 @@ import {
 
 describe("parse helpers in contracts.ts", () => {
   describe("parseUserProfile", () => {
-    it("should parse raw user profile data correctly with total_points or points", () => {
+    it("should parse raw user profile data correctly with all six fields", () => {
       const rawData = {
         address: "GALICE",
         username: "alice",
-        points: "150",
+        total_points: "150",
+        claimed_amt: "10",
+        registered_at: 1700000000,
+        bot_count: 2,
       };
 
       const result = parseUserProfile(rawData);
@@ -20,30 +23,101 @@ describe("parse helpers in contracts.ts", () => {
       expect(result).toEqual({
         address: "GALICE",
         username: "alice",
+        total_points: 150n,
         points: 150n,
+        claimed_amt: 10n,
+        claimedAmt: 10n,
+        registered_at: 1700000000,
+        registeredAt: 1700000000,
+        bot_count: 2,
+        botCount: 2,
       });
     });
 
-    it("parses correctly with bigint points", () => {
-      const raw = { address: "GALICE", username: "alice", points: 100n };
+    it("parses correctly with bigint total_points", () => {
+      const raw = {
+        address: "GALICE",
+        username: "alice",
+        total_points: 100n,
+        claimed_amt: 0n,
+        registered_at: 0,
+        bot_count: 0,
+      };
       const parsed = parseUserProfile(raw);
-      expect(parsed).toEqual({ address: "GALICE", username: "alice", points: 100n });
+      expect(parsed.total_points).toBe(100n);
+      expect(parsed.points).toBe(100n);
     });
 
-    it("parses correctly with number points", () => {
-      const raw = { address: "GBOB", username: "bob", points: 50 };
+    it("parses correctly with number total_points", () => {
+      const raw = {
+        address: "GBOB",
+        username: "bob",
+        total_points: 50,
+        claimed_amt: 5,
+        registered_at: 100,
+        bot_count: 1,
+      };
       const parsed = parseUserProfile(raw);
-      expect(parsed).toEqual({ address: "GBOB", username: "bob", points: 50n });
+      expect(parsed.total_points).toBe(50n);
 
       // A profile shape with no address still parses; the field is an empty
       // string rather than undefined so consumers never branch on it.
-      expect(parseUserProfile({ username: "bob", points: 50 }).address).toBe("");
+      expect(
+        parseUserProfile({
+          username: "bob",
+          total_points: 50,
+          claimed_amt: 0,
+          registered_at: 0,
+          bot_count: 0,
+        }).address
+      ).toBe("");
     });
 
-    it("throws naming the field when points are absent (#484)", () => {
-      expect(() => parseUserProfile({ address: "G", username: "u" })).toThrow(
+    it("throws naming the field when total_points is absent (#484)", () => {
+      expect(() => parseUserProfile({ address: "G", username: "u" } as any)).toThrow(
         /"total_points"/
       );
+    });
+
+    it("defaults claimed_amt when absent (backward compatible)", () => {
+      const parsed = parseUserProfile({
+        address: "G",
+        username: "u",
+        total_points: 0,
+      } as any);
+      expect(parsed.claimed_amt).toBe(0n);
+      expect(parsed.claimedAmt).toBe(0n);
+    });
+
+    it("deletes the legacy points fallback (no points field)", () => {
+      const raw = {
+        address: "GALICE",
+        username: "alice",
+        total_points: 150n,
+        claimed_amt: 0n,
+        registered_at: 0,
+        bot_count: 0,
+        points: 999n, // legacy field should be ignored
+      };
+      const parsed = parseUserProfile(raw as any);
+      // Should use total_points, not points, so legacy 999 is ignored
+      expect(parsed.total_points).toBe(150n);
+      expect(parsed.points).toBe(150n);
+    });
+
+    it("exposes camelCase aliases for UI compatibility", () => {
+      const raw = {
+        address: "GTEST",
+        username: "tester",
+        total_points: 42n,
+        claimed_amt: 7n,
+        registered_at: 1234567890,
+        bot_count: 3,
+      };
+      const parsed = parseUserProfile(raw);
+      expect(parsed.claimedAmt).toBe(7n);
+      expect(parsed.registeredAt).toBe(1234567890);
+      expect(parsed.botCount).toBe(3);
     });
   });
 
@@ -55,6 +129,22 @@ describe("parse helpers in contracts.ts", () => {
       accrual_rate: 10n,
       minted_at: 123456789,
       last_claim_timestamp: 123456789n,
+    };
+
+    // Real simulation fixture: tier as ScVec([ScSymbol("Gold")]) decodes to ["Gold"]
+    // via scValToNative. This is the sole shape we accept; string "Gold" is also
+    // accepted as the spec-aware generated client decodes the same enum directly
+    // to its string name.
+    const realBotFixture: Record<string, unknown> = {
+      id: 42n,
+      name: "Gold Bot",
+      owner: "GBDUJFNDCXMOAY654HWWDVOHGGCL4NZIAXGXDF4WODNUMUPTIGULZTN2",
+      tier: ["Gold"],
+      accrual_rate: 100n,
+      minted_at: 1700000000,
+      last_claim_timestamp: 1700000000n,
+      variant: 3,
+      bonus_bps: 123,
     };
 
     it("should parse raw bot NFT data correctly with string tier", () => {
@@ -81,36 +171,57 @@ describe("parse helpers in contracts.ts", () => {
       });
     });
 
-    it("parses tier as string", () => {
-      const parsed = parseBotNFT({ ...baseRaw, tier: "Premium" });
-      expect(parsed.tier).toBe("Premium");
+    it("parses tier as array-wrapped string from real simulation", () => {
+      const parsed = parseBotNFT({ ...baseRaw, tier: ["Gold"] });
+      expect(parsed.tier).toBe("Gold");
     });
 
-    it("parses tier as array", () => {
-      const parsed = parseBotNFT({ ...baseRaw, tier: [0, "Enterprise"] });
-      expect(parsed.tier).toBe("Enterprise");
+    it("decodes all five tiers correctly from real response shape", () => {
+      (["Basic", "Bronze", "Silver", "Gold", "Diamond"] as const).forEach((t) => {
+        const parsed = parseBotNFT({ ...baseRaw, tier: [t] });
+        expect(parsed.tier).toBe(t);
+      });
+      // String shape from generated client is also accepted
+      (["Basic", "Bronze", "Silver", "Gold", "Diamond"] as const).forEach((t) => {
+        const parsed = parseBotNFT({ ...baseRaw, tier: t });
+        expect(parsed.tier).toBe(t);
+      });
     });
 
-    it("parses tier as object with variant", () => {
-      const parsed = parseBotNFT({ ...baseRaw, tier: { variant: "Pro" } });
-      expect(parsed.tier).toBe("Pro");
+    it("parses real bot fixture from simulation and round-trips tier", () => {
+      const parsed = parseBotNFT(realBotFixture);
+      expect(parsed.tier).toBe("Gold");
+      expect(parsed.id).toBe(42n);
+      expect(parsed.accrual_rate).toBe(100n);
+      // Fixture's tier round-trips
+      expect(parsed.tier).toBe(realBotFixture.tier[0]);
     });
 
-    it("parses tier as object with tag", () => {
-      const parsed = parseBotNFT({ ...baseRaw, tier: { tag: "Pro" } });
-      expect(parsed.tier).toBe("Pro");
-    });
-
-    it("defaults to Basic if tier format is unknown", () => {
-      const parsed = parseBotNFT({ ...baseRaw, tier: { foo: "bar" } });
-      expect(parsed.tier).toBe("Basic");
+    it("throws on unrecognized tier instead of silently defaulting to Basic", () => {
+      expect(() => parseBotNFT({ ...baseRaw, tier: ["UnknownTier"] })).toThrow(
+        /unrecognized tier/
+      );
+      expect(() => parseBotNFT({ ...baseRaw, tier: "UnknownTier" })).toThrow(
+        /unrecognized tier/
+      );
+      expect(() => parseBotNFT({ ...baseRaw, tier: { variant: "Pro" } as any })).toThrow(
+        /unexpected tier shape/
+      );
+      expect(() => parseBotNFT({ ...baseRaw, tier: { foo: "bar" } as any })).toThrow(
+        /unexpected tier shape/
+      );
+      expect(() => parseBotNFT({ ...baseRaw, tier: [0, "Enterprise"] as any })).toThrow(
+        /unexpected tier shape/
+      );
     });
 
     it("throws naming the field when required fields are missing (#484)", () => {
-      // The old BigInt(String(v ?? 0)) silently produced 0n for an absent
-      // field, hiding phantom fields; a missing required field now throws.
-      expect(() => parseBotNFT({})).toThrow(/"id"/);
-      expect(() => parseBotNFT({ id: 1n })).toThrow(/"accrual_rate"/);
+      // Provide tier so the parser reaches the id/accrual_rate checks, not tier shape
+      expect(() => parseBotNFT({} as any)).toThrow(/unexpected tier shape/);
+      expect(() => parseBotNFT({ tier: ["Basic"] } as any)).toThrow(/"id"/);
+      expect(() => parseBotNFT({ id: 1n, tier: ["Basic"] } as any)).toThrow(
+        /"accrual_rate"/
+      );
     });
 
     it("defaults the genuinely optional fields via toBigIntOr (#484)", () => {
@@ -118,7 +229,7 @@ describe("parse helpers in contracts.ts", () => {
         id: 1n,
         name: "Bot",
         owner: "GOWNER",
-        tier: "Basic",
+        tier: ["Basic"],
         accrual_rate: 1n,
         // minted_at and last_claim_timestamp intentionally absent
       });

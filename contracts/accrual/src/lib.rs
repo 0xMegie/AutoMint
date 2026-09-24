@@ -217,7 +217,7 @@ impl AccrualContract {
         Ok(pending as i128)
     }
 
-    pub fn admin(env: Env) -> Address {
+    pub fn get_accrual_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 

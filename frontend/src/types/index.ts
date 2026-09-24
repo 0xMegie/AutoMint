@@ -10,10 +10,19 @@ export interface UserProfile {
    *  reads it from the registry's `UserProfile.address` field. */
   address: string;
   username: string;
+  /** Total points accrued on-chain (registry `total_points`). */
+  total_points: bigint;
+  /** Alias for `total_points` kept for existing UI code. */
   points: bigint;
-  botCount?: number;
-  claimedAmt?: bigint;
-  registeredAt?: number;
+  claimed_amt: bigint;
+  /** Alias for `claimed_amt` (`claimedAmt` camelCase). */
+  claimedAmt: bigint;
+  registered_at: number;
+  /** Alias for `registered_at` (`registeredAt` camelCase). */
+  registeredAt: number;
+  bot_count: number;
+  /** Alias for `bot_count` (`botCount` camelCase). */
+  botCount: number;
 }
 
 export interface BotNFT {

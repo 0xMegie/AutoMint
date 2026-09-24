@@ -480,8 +480,8 @@ export class UserRejectedError extends Error {
  * Carries the diagnostic `errorResultXdr` for debugging.
  */
 export class TxSendFailedError extends Error {
-  public resultXdr?: string;
-  constructor(message: string, resultXdr?: string) {
+  public resultXdr?: string | undefined;
+  constructor(message: string, resultXdr?: string | undefined) {
     super(message);
     this.name = "TxSendFailedError";
     this.resultXdr = resultXdr;
@@ -492,8 +492,8 @@ export class TxSendFailedError extends Error {
  * Thrown when `getTransaction` reports `FAILED` after submission.
  */
 export class TxFailedError extends Error {
-  public resultXdr?: string;
-  constructor(message: string, resultXdr?: string) {
+  public resultXdr?: string | undefined;
+  constructor(message: string, resultXdr?: string | undefined) {
     super(message);
     this.name = "TxFailedError";
     this.resultXdr = resultXdr;
@@ -562,7 +562,7 @@ export async function signTx(xdr: string, address?: string): Promise<string> {
 
     result = await signer(xdr, {
       networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
-      address: resolvedAddress,
+      ...(resolvedAddress ? { address: resolvedAddress } : {}),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
