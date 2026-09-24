@@ -15,7 +15,11 @@ function scrubString(value: string): string {
 }
 
 Sentry.init({
-  dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+  // Only pass a dsn when one is configured — `dsn: undefined` is rejected
+  // under exactOptionalPropertyTypes.
+  ...(process.env.NEXT_PUBLIC_SENTRY_DSN
+    ? { dsn: process.env.NEXT_PUBLIC_SENTRY_DSN }
+    : {}),
 
   tracesSampleRate: process.env.NODE_ENV === "production" ? 0.1 : 1.0,
 
