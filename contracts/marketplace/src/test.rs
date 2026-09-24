@@ -1650,3 +1650,170 @@ fn test_e2e_five_contract_full_flow() {
     assert!(accrual.get_accrual_state(&bob).is_some());
     assert_eq!(registry.total_users(), 2, "total_users still 2 at end");
 }
+
+#[test]
+fn test_bot_nft_validation_on_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let invalid_addr = Address::generate(&env);
+
+    let marketplace_id = env.register_contract(None, MarketplaceContract);
+    let mkt = MarketplaceContractClient::new(&env, &marketplace_id);
+
+    let result = mkt.try_initialize(&admin, &invalid_addr, &250u32);
+    assert_eq!(
+        result,
+        Err(Ok(MarketplaceError::InvalidBotNft)),
+        "initialize with non-contract should fail"
+    );
+}
+
+#[test]
+fn test_bot_nft_validation_on_set_bot_nft() {
+    let h = setup();
+    let invalid_addr = Address::generate(&h.env);
+
+    let result = h.mkt.try_set_bot_nft(&invalid_addr);
+    assert_eq!(
+        result,
+        Err(Ok(MarketplaceError::InvalidBotNft)),
+        "set_bot_nft with invalid address should fail"
+    );
+}
+
+#[test]
+fn test_bot_nft_getter() {
+    let h = setup();
+    assert_eq!(h.mkt.bot_nft(), h.bot.address);
+}
+
+#[test]
+fn test_per_seller_listing_limit() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+    let cap = h.mkt.get_listing_cap();
+    assert_eq!(cap, 50, "default cap should be 50");
+
+    for i in 0..cap {
+        let bot_id = h.bot.mint_basic(&seller);
+        let result = h.mkt.try_list_bot(
+            &seller,
+            &bot_id,
+            &(100_0000000_i128 + i as i128),
+            &h.token.address,
+        );
+        assert!(
+            result.is_ok(),
+            "listing #{} should succeed",
+            i + 1
+        );
+    }
+
+    let bot_id = h.bot.mint_basic(&seller);
+    let result = h.mkt.try_list_bot(
+        &seller,
+        &bot_id,
+        &(100_0000000_i128 + cap as i128),
+        &h.token.address,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(MarketplaceError::TooManyListings)),
+        "51st listing should exceed cap"
+    );
+
+    assert_eq!(
+        h.mkt.get_user_active_listing_count(&seller),
+        cap,
+        "active count should equal cap"
+    );
+}
+
+#[test]
+fn test_listing_count_decreases_on_cancel() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+
+    let bot1 = h.bot.mint_basic(&seller);
+    let listing1 = h
+        .mkt
+        .list_bot(&seller, &bot1, &100_0000000_i128, &h.token.address);
+
+    let bot2 = h.bot.mint_basic(&seller);
+    let listing2 = h
+        .mkt
+        .list_bot(&seller, &bot2, &100_0000000_i128, &h.token.address);
+
+    assert_eq!(
+        h.mkt.get_user_active_listing_count(&seller),
+        2,
+        "seller should have 2 active listings"
+    );
+
+    h.mkt.cancel_listing(&seller, &listing1);
+
+    assert_eq!(
+        h.mkt.get_user_active_listing_count(&seller),
+        1,
+        "seller should have 1 active listing after cancel"
+    );
+
+    h.mkt.cancel_listing(&seller, &listing2);
+
+    assert_eq!(
+        h.mkt.get_user_active_listing_count(&seller),
+        0,
+        "seller should have 0 active listings after cancelling all"
+    );
+}
+
+#[test]
+fn test_listing_count_decreases_on_purchase() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+    let buyer = Address::generate(&h.env);
+    let price = 100_0000000_i128;
+
+    let bot1 = h.bot.mint_basic(&seller);
+    let listing1 = h
+        .mkt
+        .list_bot(&seller, &bot1, &price, &h.token.address);
+
+    let bot2 = h.bot.mint_basic(&seller);
+    let listing2 = h
+        .mkt
+        .list_bot(&seller, &bot2, &price, &h.token.address);
+
+    h.token.mint(&buyer, &(price * 2));
+
+    h.mkt.buy_bot(&buyer, &listing1);
+
+    assert_eq!(
+        h.mkt.get_user_active_listing_count(&seller),
+        1,
+        "seller should have 1 active listing after sale"
+    );
+}
+
+#[test]
+fn test_admin_can_adjust_listing_cap() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+
+    h.mkt.set_listing_cap(&10);
+    assert_eq!(h.mkt.get_listing_cap(), 10);
+
+    for i in 0..10 {
+        let bot_id = h.bot.mint_basic(&seller);
+        h.mkt.list_bot(&seller, &bot_id, &(50_0000000_i128 + i as i128), &h.token.address);
+    }
+
+    let bot_id = h.bot.mint_basic(&seller);
+    let result = h.mkt.try_list_bot(&seller, &bot_id, &100_0000000_i128, &h.token.address);
+    assert_eq!(
+        result,
+        Err(Ok(MarketplaceError::TooManyListings)),
+        "11th listing should exceed new cap of 10"
+    );
+}
