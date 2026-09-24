@@ -8,6 +8,7 @@ import {
   useAccrualState,
   useClaim,
   useAmtBalance,
+  useAmtDecimals,
 } from "@/hooks/useAccrual";
 import { useAllBotDetails } from "@/hooks/useBotDetails";
 import { getPendingPoints } from "@/lib/contracts";
@@ -68,6 +69,7 @@ export default function DashboardPage() {
   } = useAllBotDetails(botIds || []);
 
   const { data: amtBalance, isPending: isAmtBalancePending } = useAmtBalance();
+  const { data: amtDecimals } = useAmtDecimals();
   const claim = useClaim();
 
   const [pendingPoints, setPendingPoints] = useState<bigint>(BigInt(0));
@@ -283,6 +285,7 @@ export default function DashboardPage() {
             rate={isLoading ? 0 : totalRate}
             bots={isLoading ? [] : bots || []}
             amtBalance={isLoading ? BigInt(0) : amtBalance ?? BigInt(0)}
+            amtDecimals={amtDecimals}
           />
 
           {/* Claim Button */}

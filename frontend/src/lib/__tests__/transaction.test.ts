@@ -111,8 +111,8 @@ jest.mock("@stellar/freighter-api", () => ({
   getAddress: jest.fn(),
 }));
 
-import { executeTransaction } from "./transaction";
-import { STELLAR_NETWORK_PASSPHRASE } from "./constants";
+import { executeTransaction } from "../transaction";
+import { STELLAR_NETWORK_PASSPHRASE } from "../constants";
 import { useWalletStore } from "@/store/walletStore";
 
 const SOURCE = "GTESTSOURCE";

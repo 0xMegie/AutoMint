@@ -6,6 +6,8 @@ import {
   isRegistered,
   getUserBots,
   getAmtBalance,
+  getAmtDecimals,
+  getUserTotalRate,
 } from "@/lib/contracts";
 import { executeTransaction, type TransactionStatus } from "@/lib/transaction";
 import { getLedgerCloseTime } from "@/lib/stellar";
@@ -290,6 +292,38 @@ export function useAmtBalance() {
   });
 }
 
+/** The AMT token's decimals, read once per session from the token contract (#479). */
+export function useAmtDecimals() {
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useQuery<number>({
+    queryKey: qk.amtDecimals(),
+    queryFn: () => getAmtDecimals(publicKey ?? undefined),
+    enabled: !!publicKey,
+    staleTime: STALE_TIME.STATIC,
+    gcTime: GC_TIME.LONG,
+  });
+}
+
+/**
+ * Combined accrual rate (pts/hr) of every bot the connected wallet owns, from
+ * bot_nft `get_user_total_rate` (#490). Polled like the rest of the dashboard,
+ * so buying, selling or minting a bot changes the rate on the next poll.
+ */
+export function useUserTotalRate() {
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useQuery<bigint>({
+    queryKey: qk.userTotalRate(publicKey),
+    queryFn: () =>
+      publicKey ? getUserTotalRate(publicKey) : Promise.resolve(BigInt(0)),
+    enabled: !!publicKey,
+    refetchInterval: pollWhenVisible(),
+    staleTime: STALE_TIME.STANDARD,
+    gcTime: GC_TIME.STANDARD,
+  });
+}
+
 export interface DashboardData {
   registered: boolean;
   profile: UserProfile | null;
@@ -524,18 +558,22 @@ export interface AnimatedPoints {
   progressToNext: bigint;
 }
 
-export function useAnimatedPoints(ratePerHour: number = BASIC_BOT_RATE): AnimatedPoints {
+export function useAnimatedPoints(): AnimatedPoints {
   const [pending, setPending] = useState<bigint>(BigInt(0));
 
   const { data: accrualState } = useAccrualState();
   const { data: profile } = useProfile();
+  // The user's real on-chain rate across all their bots (#490), not a default.
+  // When the accrual state carries its own `rate` (AM-101) read it from there
+  // instead, so the interpolation matches the contract's own view exactly.
+  const { data: ratePerHour } = useUserTotalRate();
   const offsetMs = useLedgerTimeOffset();
   const offsetRef = useRef(offsetMs);
   offsetRef.current = offsetMs;
 
   useEffect(() => {
     const tick = () => {
-      if (!accrualState) {
+      if (!accrualState || ratePerHour === undefined) {
         setPending(BigInt(0));
         return;
       }
@@ -548,7 +586,7 @@ export function useAnimatedPoints(ratePerHour: number = BASIC_BOT_RATE): Animate
         return;
       }
       setPending(
-        BigInt(Math.floor((elapsedSeconds * ratePerHour) / POINTS_PER_HOUR_DIVISOR)),
+        (BigInt(elapsedSeconds) * ratePerHour) / BigInt(POINTS_PER_HOUR_DIVISOR),
       );
     };
 

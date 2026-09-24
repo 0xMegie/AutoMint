@@ -4,7 +4,7 @@ import { useState, useMemo, useId } from "react";
 import dynamic from "next/dynamic";
 import { toast } from "sonner";
 import { useListBot } from "@/hooks/useMarketplace";
-import { xlmToStroops, stroopsToXlm, XLM_DECIMALS } from "@/types";
+import { xlmToStroops, stroopsToXlm, XLM_DECIMALS } from "@/lib/format";
 import type { BotNFT } from "@/types";
 import clsx from "clsx";
 

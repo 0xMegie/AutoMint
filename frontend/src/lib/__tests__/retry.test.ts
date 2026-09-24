@@ -1,4 +1,4 @@
-import { retryQuery, retryMutation, wasSignatureRequested } from "./retry";
+import { retryQuery, retryMutation, wasSignatureRequested } from "../retry";
 
 describe("retryQuery (#497)", () => {
   it("retries a network / RPC failure, up to the cap", () => {

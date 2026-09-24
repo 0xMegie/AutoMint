@@ -16,7 +16,7 @@ import {
   MAX_RETRIES,
   BASE_DELAY_MS,
   MAX_JITTER_MS,
-} from "./rpcRetry";
+} from "../rpcRetry";
 
 /** Deterministic jitter so backoff assertions are exact. */
 function pinJitter(value = 0.5) {
