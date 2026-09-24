@@ -1,8 +1,6 @@
 import {
   Contract,
   SorobanRpc,
-  TransactionBuilder,
-  scValToNative,
   nativeToScVal,
   xdr,
 } from "@stellar/stellar-sdk";
@@ -17,12 +15,69 @@ import {
   STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
-import { rpcCall, simulateContractCall, buildPreparedTx } from "./stellar";
+import { rpcCall, simulateContractCall } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
-const toBigInt = (v: unknown): bigint =>
-  typeof v === "bigint" ? v : BigInt(String(v ?? 0));
+/**
+ * Strict conversion of an untyped, contract-decoded value to `bigint` (#484).
+ *
+ * Accepts a `bigint`, an integral `number`, or a base-10 integer string --
+ * the three shapes `scValToNative` actually produces for integer ScVals.
+ * Anything else throws an error naming `field`. In particular an *absent*
+ * field no longer collapses to `0n` the way the old
+ * `BigInt(String(v ?? 0))` did, and garbage such as `{}` (whose `String()`
+ * form is `"[object Object]"`) fails with a message that names the field
+ * instead of an opaque SyntaxError -- so phantom fields such as AM-158's
+ * go noticed immediately.
+ *
+ * For fields that are legitimately optional use {@link toBigIntOr}, which
+ * makes the fallback explicit at the call site.
+ *
+ * @param v - raw value read off the decoded simulation result.
+ * @param field - contract/struct field name, quoted back in the error.
+ * @throws {Error} when `v` is missing or not integer-shaped.
+ */
+export function toBigInt(v: unknown, field: string): bigint {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number") {
+    if (!Number.isInteger(v)) {
+      throw new Error(`toBigInt: field "${field}" must be an integer, got ${v}`);
+    }
+    return BigInt(v);
+  }
+  if (typeof v === "string") {
+    if (/^-?\d+$/.test(v)) return BigInt(v);
+    throw new Error(
+      `toBigInt: field "${field}" must be a base-10 integer string, got ${JSON.stringify(v)}`
+    );
+  }
+  if (v === undefined || v === null) {
+    throw new Error(`toBigInt: required field "${field}" is missing`);
+  }
+  throw new Error(
+    `toBigInt: field "${field}" has unsupported type ${typeof v}: ${String(v)}`
+  );
+}
+
+/**
+ * {@link toBigInt} with an explicit fallback for genuinely optional fields
+ * (#484). Returns `fallback` only when the field is absent (`undefined` /
+ * `null`); a present-but-garbage value still throws, so "optional" never
+ * means "silent zero".
+ *
+ * @param v - raw value, possibly absent.
+ * @param fallback - value to use when the field is absent.
+ * @param field - contract/struct field name, quoted back in the error.
+ */
+export function toBigIntOr(
+  v: unknown,
+  fallback: bigint,
+  field = "value"
+): bigint {
+  if (v === undefined || v === null) return fallback;
+  return toBigInt(v, field);
+}
 
 /**
  * Resolve the source address used for read-only simulations that have no
@@ -84,9 +139,13 @@ async function buildTxXdr(
   args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<string> {
-  const server = getServer();
+  // TransactionBuilder is imported here, and only here: every read in this
+  // file goes through simulateContractCall, so this is the single place that
+  // assembles transactions (#481).
+  const { TransactionBuilder } = await import("@stellar/stellar-sdk");
+
   const contract = new Contract(contractId);
-  const account = await server.getAccount(sourceAddress);
+  const account = await rpcCall((server) => server.getAccount(sourceAddress));
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
@@ -96,7 +155,7 @@ async function buildTxXdr(
     .setTimeout(TX_TIMEOUT)
     .build();
 
-  const sim = await withRetry(() => server.simulateTransaction(tx));
+  const sim = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(sim)) {
     throw new Error(`Simulation failed for ${method}: ${sim.error}`);
@@ -118,8 +177,10 @@ async function buildTxXdr(
 export function parseUserProfile(
   rawData: Record<string, unknown>
 ): UserProfile {
-  const raw = rawData.total_points ?? rawData.points;
-  const points = typeof raw === "bigint" ? raw : BigInt(String(raw ?? 0));
+  const points = toBigInt(
+    rawData.total_points ?? rawData.points,
+    "total_points"
+  );
   return {
     address: String(rawData.address ?? ""),
     username: String(rawData.username ?? ""),
@@ -152,13 +213,17 @@ export function parseBotNFT(rawData: Record<string, unknown>): BotNFT {
   }
 
   return {
-    id: toBigInt(rawData.id),
+    id: toBigInt(rawData.id, "id"),
     name: String(rawData.name ?? ""),
     owner: String(rawData.owner ?? ""),
     tier,
-    accrual_rate: toBigInt(rawData.accrual_rate),
-    minted_at: Number(rawData.minted_at ?? 0),
-    last_claim_timestamp: toBigInt(rawData.last_claim_timestamp),
+    accrual_rate: toBigInt(rawData.accrual_rate, "accrual_rate"),
+    minted_at: Number(toBigIntOr(rawData.minted_at, 0n, "minted_at")),
+    last_claim_timestamp: toBigIntOr(
+      rawData.last_claim_timestamp,
+      0n,
+      "last_claim_timestamp"
+    ),
   };
 }
 
@@ -169,11 +234,11 @@ export function parseListing(
   rawData: Record<string, unknown>
 ): MarketplaceListing {
   return {
-    id: toBigInt(rawData.id),
+    id: toBigInt(rawData.id, "id"),
     seller: String(rawData.seller ?? ""),
-    bot_id: toBigInt(rawData.bot_id),
-    price: toBigInt(rawData.price),
-    listed_at: toBigInt(rawData.listed_at),
+    bot_id: toBigInt(rawData.bot_id, "bot_id"),
+    price: toBigInt(rawData.price, "price"),
+    listed_at: toBigInt(rawData.listed_at, "listed_at"),
   };
 }
 
@@ -188,7 +253,7 @@ export async function getAmtBalance(userAddress: string): Promise<bigint> {
     [nativeToScVal(userAddress, { type: "address" })],
     userAddress
   );
-  return toBigInt(balance);
+  return toBigInt(balance, "balance");
 }
 
 /**
@@ -544,37 +609,21 @@ export async function getAccrualState(userAddress: string): Promise<AccrualState
   if (!stateRaw) return null;
 
   return {
-    last_claim_ts: toBigInt(stateRaw.last_claim_ts),
-    total_claimed_points: toBigInt(stateRaw.total_claimed_points),
+    last_claim_ts: toBigInt(stateRaw.last_claim_ts, "last_claim_ts"),
+    total_claimed_points: toBigInt(
+      stateRaw.total_claimed_points,
+      "total_claimed_points"
+    ),
   };
 }
 
 /**
  * Get pending (unclaimed) points accrued for a user since their last claim.
- * Calls the accrual contract's pending_points() function.
+ * Calls the accrual contract's pending_points() function (#481).
  */
 export async function getPendingPoints(userAddress: string): Promise<bigint> {
-  const contract = new Contract(ACCRUAL_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await rpcCall((server) => server.getAccount(userAddress)),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("pending_points", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await rpcCall((server) => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching pending points: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return BigInt(0);
-  }
-
-  return toBigInt(scValToNative(result.result.retval));
+  const raw = await simulateContractCall(ACCRUAL_CONTRACT_ID, "pending_points", [nativeToScVal(userAddress, { type: "address" })], userAddress);
+  return toBigInt(raw, "pending_points");
 }
 
 /**
@@ -655,92 +704,40 @@ export async function getUserProfile(userAddress: string): Promise<UserProfile |
 }
 
 /**
- * Get the list of bot IDs owned by a user from the bot_nft contract.
+ * Get the list of bot IDs owned by a user from the bot_nft contract (#481).
  */
 export async function getUserBots(userAddress: string): Promise<bigint[]> {
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await rpcCall((server) => server.getAccount(userAddress)),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_user_bots", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await rpcCall((server) => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching user bots: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return [];
-  }
-
-  const raw = scValToNative(result.result.retval);
-  if (!Array.isArray(raw)) return [];
-
-  return raw.map((id) => toBigInt(id));
+  const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_user_bots", [nativeToScVal(userAddress, { type: "address" })], userAddress);
+  if (!Array.isArray(raw)) throw new Error(`get_user_bots returned unexpected type ${typeof raw}; expected array`);
+  return raw.map((id) => toBigInt(id, "bot_id"));
 }
 
 /**
- * Get a single bot's full record by ID from the bot_nft contract.
+ * Fetch a user's bots with full records in a single contract round trip
+ * (#483). The contract caps the result at its `MAX_DETAILED_BOTS`; callers
+ * needing more fall back to {@link getUserBots} + {@link getBotById} for
+ * the remainder.
  */
-export async function getBotById(
-  userAddress: string,
-  botId: bigint
-): Promise<BotNFT | null> {
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
+export async function getUserBotsDetailed(userAddress: string): Promise<BotNFT[]> {
+  const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_user_bots_detailed", [nativeToScVal(userAddress, { type: "address" })], userAddress);
+  if (!Array.isArray(raw)) throw new Error(`get_user_bots_detailed returned unexpected type ${typeof raw}; expected array`);
+  return raw.map((entry) => parseBotNFT(entry as Record<string, unknown>));
+}
 
-  const tx = new TransactionBuilder(
-    await rpcCall((server) => server.getAccount(userAddress)),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_bot", nativeToScVal(botId, { type: "u64" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await rpcCall((server) => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching bot #${botId.toString()}: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return null;
-  }
-
-  const raw = scValToNative(result.result.retval);
-  if (!raw) return null;
-
-  return parseBotNFT(raw as Record<string, unknown>);
+/**
+ * Get a single bot's full record by ID from the bot_nft contract (#481).
+ * Errors propagate: a simulation failure is never swallowed as `null`.
+ */
+export async function getBotById(userAddress: string, botId: bigint): Promise<BotNFT | null> {
+  const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_bot", [nativeToScVal(botId, { type: "u64" })], userAddress);
+  return raw ? parseBotNFT(raw as Record<string, unknown>) : null;
 }
 
 /**
  * Get a user's combined accrual rate across all owned bots from the
- * bot_nft contract.
+ * bot_nft contract (#481).
  */
 export async function getUserTotalRate(userAddress: string): Promise<bigint> {
-  const contract = new Contract(BOT_NFT_CONTRACT_ID);
-
-  const tx = new TransactionBuilder(
-    await rpcCall((server) => server.getAccount(userAddress)),
-    { fee: BASE_FEE, networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-  )
-    .addOperation(contract.call("get_user_total_rate", nativeToScVal(userAddress, { type: "address" })))
-    .setTimeout(TX_TIMEOUT)
-    .build();
-
-  const result = await rpcCall((server) => server.simulateTransaction(tx));
-
-  if (SorobanRpc.Api.isSimulationError(result)) {
-    throw new Error(`Simulation error fetching user total rate: ${result.error}`);
-  }
-
-  if (!result.result?.retval) {
-    return BigInt(0);
-  }
-
-  return toBigInt(scValToNative(result.result.retval));
+  const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_user_total_rate", [nativeToScVal(userAddress, { type: "address" })], userAddress);
+  return toBigInt(raw, "get_user_total_rate");
 }

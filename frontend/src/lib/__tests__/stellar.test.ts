@@ -10,6 +10,8 @@
 const mockGetAccount = jest.fn();
 const mockSimulateTransaction = jest.fn();
 const mockPrepareTransaction = jest.fn();
+const mockSendTransaction = jest.fn();
+const mockGetTransaction = jest.fn();
 const mockIsSimulationError = jest.fn();
 const mockScValToNative = jest.fn();
 const mockBuiltTx = { tx: true, toXDR: jest.fn(() => "UNPREPARED_XDR") };
@@ -21,6 +23,8 @@ jest.mock("@stellar/stellar-sdk", () => ({
       getAccount: mockGetAccount,
       simulateTransaction: mockSimulateTransaction,
       prepareTransaction: mockPrepareTransaction,
+      sendTransaction: mockSendTransaction,
+      getTransaction: mockGetTransaction,
     })),
     Api: {
       isSimulationError: (...args: unknown[]) => mockIsSimulationError(...args),
@@ -52,7 +56,13 @@ import {
   requestAccess,
   getNetwork,
 } from "@stellar/freighter-api";
-import { connectFreighter, simulateContractCall, buildPreparedTx } from "../stellar";
+import {
+  connectFreighter,
+  simulateContractCall,
+  buildPreparedTx,
+  submitTx,
+  invalidateReadCaches,
+} from "../stellar";
 
 const mockIsConnected = isConnected as jest.Mock;
 const mockRequestAccess = requestAccess as jest.Mock;
@@ -60,6 +70,9 @@ const mockGetNetwork = getNetwork as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // Read caches (#482) are module-level state: start every test cold so
+  // account-TTL / in-flight entries never leak across cases.
+  invalidateReadCaches();
 });
 
 describe("connectFreighter", () => {
@@ -162,5 +175,108 @@ describe("buildPreparedTx", () => {
     await expect(
       buildPreparedTx("CCONTRACT", "register", [], "GSRC")
     ).rejects.toThrow(/insufficient resource fee/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read-path caching (#482)
+// ---------------------------------------------------------------------------
+describe("read caching (#482)", () => {
+  const src = "GCACHE";
+
+  beforeEach(() => {
+    mockGetAccount.mockResolvedValue({ accountId: () => src });
+    mockSimulateTransaction.mockResolvedValue({
+      result: { retval: { xdr: true } },
+    });
+    mockIsSimulationError.mockReturnValue(false);
+    mockScValToNative.mockReturnValue(1);
+  });
+
+  it("makes a single getAccount fetch for six concurrent reads", async () => {
+    await Promise.all([
+      simulateContractCall("C1", "a", [], src),
+      simulateContractCall("C2", "b", [], src),
+      simulateContractCall("C3", "c", [], src),
+      simulateContractCall("C4", "d", [], src),
+      simulateContractCall("C5", "e", [], src),
+      simulateContractCall("C6", "f", [], src),
+    ]);
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(6);
+  });
+
+  it("shares one in-flight promise for identical concurrent simulations", async () => {
+    const [first, second] = await Promise.all([
+      simulateContractCall("CX", "total_users", [], src),
+      simulateContractCall("CX", "total_users", [], src),
+    ]);
+    expect(first).toBe(second);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cache a failed account fetch and propagates the error", async () => {
+    mockGetAccount.mockRejectedValueOnce(new Error("account unavailable"));
+
+    await expect(
+      simulateContractCall("CX", "x", [], src)
+    ).rejects.toThrow("account unavailable");
+
+    // The failure was never cached: the next read retries getAccount.
+    await simulateContractCall("CX", "x", [], src);
+    expect(mockGetAccount).toHaveBeenCalledTimes(2);
+  });
+
+  it("keys simulations by encoded args so distinct args are not deduped", async () => {
+    const withXdr = { toXDR: () => ({ toString: () => "base64-arg" }) };
+    const withThrowingXdr = {
+      toXDR: () => {
+        throw new Error("nope");
+      },
+    };
+    const plain = { plain: true };
+
+    // One of each key shape: base64 XDR, JSON fallback, throwing toXDR.
+    // Sequential calls must NOT share (entries are dropped once settled).
+    await simulateContractCall("CX", "m", [withXdr as never], src);
+    await simulateContractCall("CX", "m", [plain as never], src);
+    await simulateContractCall("CX", "m", [withThrowingXdr as never], src);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(3);
+  });
+
+  it("drops the account cache after a confirmed transaction", async () => {
+    await simulateContractCall("CX", "balance", [], src);
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+
+    mockSendTransaction.mockResolvedValue({
+      status: "PENDING",
+      hash: "abc123",
+    });
+    mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
+    await submitTx("SIGNED_XDR");
+
+    await simulateContractCall("CX", "balance", [], src);
+    expect(mockGetAccount).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates the caches after a failed transaction too", async () => {
+    await simulateContractCall("CX", "balance", [], src);
+    expect(mockGetAccount).toHaveBeenCalledTimes(1);
+
+    mockSendTransaction.mockResolvedValue({
+      status: "PENDING",
+      hash: "abc123",
+    });
+    mockGetTransaction.mockResolvedValue({
+      status: "FAILED",
+      resultXdr: "AAAA",
+    });
+    await expect(submitTx("SIGNED_XDR")).rejects.toThrow(
+      /Transaction failed on-chain/
+    );
+
+    await simulateContractCall("CX", "balance", [], src);
+    expect(mockGetAccount).toHaveBeenCalledTimes(2);
   });
 });
