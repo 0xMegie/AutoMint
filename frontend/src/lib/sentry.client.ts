@@ -28,17 +28,28 @@ function scrubString(value: string): string {
 function scrubBreadcrumbs(breadcrumbs: Sentry.Breadcrumb[]): Sentry.Breadcrumb[] {
   return breadcrumbs.map((b) => ({
     ...b,
-    message: b.message ? scrubString(b.message) : b.message,
-    data: b.data
-      ? Object.fromEntries(
-          Object.entries(b.data).map(([k, v]) => [k, typeof v === "string" ? scrubString(v) : v]),
-        )
-      : b.data,
+    // Optional props are only re-specified when present — `exactOptionalPropertyTypes`
+    // forbids assigning `undefined` to them.
+    ...(b.message ? { message: scrubString(b.message) } : {}),
+    ...(b.data
+      ? {
+          data: Object.fromEntries(
+            Object.entries(b.data).map(([k, v]) => [
+              k,
+              typeof v === "string" ? scrubString(v) : v,
+            ]),
+          ),
+        }
+      : {}),
   }));
 }
 
 Sentry.init({
-  dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+  // Only pass a dsn when one is configured — `dsn: undefined` is rejected
+  // under exactOptionalPropertyTypes, and an empty string is meaningless.
+  ...(process.env.NEXT_PUBLIC_SENTRY_DSN
+    ? { dsn: process.env.NEXT_PUBLIC_SENTRY_DSN }
+    : {}),
 
   /**
    * Sample 10 % of traces in production; 100 % in other environments so
@@ -55,8 +66,10 @@ Sentry.init({
    * allows it through.
    */
   beforeSend(event) {
-    if (event.breadcrumbs?.values) {
-      event.breadcrumbs.values = scrubBreadcrumbs(event.breadcrumbs.values);
+    // `breadcrumbs` is a plain array on the Event type (not a Map), so it is
+    // replaced wholesale after scrubbing.
+    if (event.breadcrumbs) {
+      event.breadcrumbs = scrubBreadcrumbs(event.breadcrumbs);
     }
 
     if (event.request?.url) {
