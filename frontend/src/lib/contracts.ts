@@ -17,8 +17,9 @@ import {
   STELLAR_NETWORK_PASSPHRASE,
   ANONYMOUS_READ_SOURCE,
 } from "./constants";
-import { rpcCall, simulateContractCall, buildPreparedTx } from "./stellar";
+import { rpcCall, simulateContractCall, buildPreparedTx, getServer } from "./stellar";
 import { useWalletStore } from "@/store/walletStore";
+import { withRetry } from "./rpcRetry";
 import type { BotNFT, UserProfile, BotTier, MarketplaceListing, AccrualState } from "@/types";
 
 const toBigInt = (v: unknown): bigint =>
