@@ -14,6 +14,8 @@ import {
   selectSetNetworkMismatch,
   selectSetError,
   selectDisconnect,
+  selectWasConnected,
+  selectClearPersistedSession,
 } from "@/store/walletStore";
 import { STELLAR_NETWORK_PASSPHRASE } from "@/lib/constants";
 import { qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
@@ -83,12 +85,14 @@ export function useWallet() {
   const status = useWalletStore(selectStatus);
   const publicKey = useWalletStore(selectPublicKey);
   const networkMismatch = useWalletStore(selectNetworkMismatch);
+  const wasConnected = useWalletStore(selectWasConnected);
 
   const setConnecting = useWalletStore(selectSetConnecting);
   const setConnected = useWalletStore(selectSetConnected);
   const setNetworkMismatch = useWalletStore(selectSetNetworkMismatch);
   const setError = useWalletStore(selectSetError);
   const disconnect = useWalletStore(selectDisconnect);
+  const clearPersistedSession = useWalletStore(selectClearPersistedSession);
 
   const queryClient = useQueryClient();
 
@@ -142,6 +146,60 @@ export function useWallet() {
     disconnect();
     toast.success("Wallet disconnected");
   }, [disconnect]);
+
+  // -------------------------------------------------------------------------
+  // Silent session restore (#456)
+  //
+  // The store persists only a `wasConnected` flag and the last address —
+  // never a secret. On mount, if that flag is set, the session is re-derived
+  // with getAddress() + getNetwork(), which do NOT open the authorization
+  // popup for an already-authorized origin. Freighter still holds the grant,
+  // so a full page reload lands the user back where they were.
+  //
+  // Failure handling:
+  //   • Revoked / removed access (getAddress returns no address): the stale
+  //     flag is cleared so the next load starts clean.
+  //   • Wallet locked (message mentions "lock"): the flag is KEPT — the user
+  //     simply unlocks and reloads to restore.
+  //   • Anything else: treated like revocation and cleared, so a stored flag
+  //     can never strand the UI in a permanent restore loop.
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!wasConnected || status !== "disconnected") return;
+    let cancelled = false;
+
+    const restore = async () => {
+      try {
+        const { address, error } = await getAddress();
+        if (cancelled) return;
+
+        if (error || !address) {
+          const message = (error?.message ?? "").toLowerCase();
+          if (!message.includes("lock")) {
+            clearPersistedSession();
+          }
+          return;
+        }
+
+        const net = await getNetwork();
+        if (cancelled) return;
+
+        setConnected(address, net.networkPassphrase);
+        setNetworkMismatch(net.networkPassphrase !== STELLAR_NETWORK_PASSPHRASE);
+      } catch (err) {
+        if (cancelled) return;
+        const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
+        if (!message.includes("lock")) {
+          clearPersistedSession();
+        }
+      }
+    };
+
+    restore();
+    return () => {
+      cancelled = true;
+    };
+  }, [wasConnected, status, setConnected, setNetworkMismatch, clearPersistedSession]);
 
   // -------------------------------------------------------------------------
   // Background wallet state poll (#457)
