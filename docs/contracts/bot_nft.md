@@ -127,6 +127,26 @@ let ids = bot_nft_client.get_user_bots(&user);
 
 ---
 
+### get_user_bots_detailed
+
+```rust
+pub fn get_user_bots_detailed(env: Env, user: Address) -> Vec<BotNFT>
+```
+
+Return the full `BotNFT` records for up to the first `MAX_DETAILED_BOTS` (50)
+bots owned by `user`, in ownership order. One simulation replaces an N+1
+fan-out of `get_user_bots` + `get_bot` for dashboards. The cap is enforced
+contract-side; callers needing more paginate with `get_user_bots` +
+`get_bot`.
+
+Example:
+
+```rust
+let bots = bot_nft_client.get_user_bots_detailed(&user);
+```
+
+---
+
 ### get_user_total_rate
 
 ```rust
