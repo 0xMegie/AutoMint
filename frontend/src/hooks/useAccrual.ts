@@ -15,6 +15,7 @@ import { nativeToScVal } from "@stellar/stellar-sdk";
 import type { AccrualState, UserProfile } from "@/types";
 import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
+import { trackStatus, newTxId } from "@/components/ui/TxStatus";
 
 const BASIC_BOT_RATE = 1; // Basic bot accrual rate
 const UPDATE_INTERVAL = 1000; // Update every second
@@ -350,6 +351,7 @@ export function useClaim() {
       const ACCRUAL_CONTRACT_ID = process.env.NEXT_PUBLIC_ACCRUAL_CONTRACT_ID || "";
       const TOKEN_CONTRACT_ID = process.env.NEXT_PUBLIC_TOKEN_CONTRACT_ID || "";
       const REGISTRY_CONTRACT_ID = process.env.NEXT_PUBLIC_REGISTRY_CONTRACT_ID || "";
+      const txId = newTxId("claim");
 
       return new Promise((resolve, reject) => {
         executeTransaction({
@@ -362,6 +364,7 @@ export function useClaim() {
           ],
           sourceAddress: publicKey,
           onStatus: (status: TransactionStatus) => {
+            trackStatus(txId, "Claim", status);
             switch (status.stage) {
               case "building":
               case "simulating":
@@ -403,16 +406,52 @@ export function useClaim() {
         }).catch(reject);
       });
     },
-    onSuccess: () => {
+    onMutate: async () => {
+      // Optimistic update (#462): zero the pending counter immediately by
+      // moving last_claim_ts to now. Snapshot for rollback in onError.
+      await queryClient.cancelQueries({ queryKey: qk.accrualState(publicKey) });
+      await queryClient.cancelQueries({ queryKey: qk.dashboard(publicKey) });
+      const previousAccrual = queryClient.getQueryData(qk.accrualState(publicKey));
+      const previousDashboard = queryClient.getQueryData(qk.dashboard(publicKey));
+      const nowSec = BigInt(Math.floor(Date.now() / 1000));
+      queryClient.setQueryData(
+        qk.accrualState(publicKey),
+        (old: AccrualState | null | undefined) =>
+          old ? { ...old, last_claim_ts: nowSec, total_claimed_points: 0n } : old
+      );
+      queryClient.setQueryData(
+        qk.dashboard(publicKey),
+        (old: DashboardData | undefined) =>
+          old
+            ? {
+                ...old,
+                accrualState: old.accrualState
+                  ? { ...old.accrualState, last_claim_ts: nowSec, total_claimed_points: 0n }
+                  : old.accrualState,
+              }
+            : old
+      );
+      return { previousAccrual, previousDashboard };
+    },
+    onError: (
+      error: Error,
+      _variables: void,
+      context: { previousAccrual: unknown; previousDashboard: unknown } | undefined
+    ) => {
+      // Roll back to the true state on failure (#462).
+      if (context) {
+        queryClient.setQueryData(qk.accrualState(publicKey), context.previousAccrual);
+        queryClient.setQueryData(qk.dashboard(publicKey), context.previousDashboard);
+      }
+      // onStatus callback already handles error toasts
+      console.error("Claim failed:", error);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.amtBalance(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["leaderboard"] });
       queryClient.invalidateQueries({ queryKey: qk.dashboard(publicKey) });
-    },
-    onError: (error: Error) => {
-      // onStatus callback already handles error toasts
-      console.error("Claim failed:", error);
     },
   });
 }

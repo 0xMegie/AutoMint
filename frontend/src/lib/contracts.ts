@@ -810,3 +810,143 @@ export async function getUserTotalRate(userAddress: string): Promise<bigint> {
   const raw = await simulateContractCall(BOT_NFT_CONTRACT_ID, "get_user_total_rate", [nativeToScVal(userAddress, { type: "address" })], userAddress);
   return toBigInt(raw, "get_user_total_rate");
 }
+
+// -- Contract preflight (#464) ------------------------------------------------
+
+/** Reachability of a single configured contract. */
+export type PreflightKind = "ok" | "unreachable-rpc" | "contract-not-found";
+
+export interface ContractPreflightResult {
+  /** Key in CONTRACT_ADDRESSES (registry, botNft, accrual, marketplace, token). */
+  name: string;
+  contractId: string;
+  ok: boolean;
+  kind: PreflightKind;
+  /** Underlying error message when ok is false. */
+  error?: string;
+}
+
+export interface PreflightReport {
+  ok: boolean;
+  results: ContractPreflightResult[];
+}
+
+/**
+ * Classify a preflight failure: RPC/network outages ("unreachable RPC") vs
+ * anything the simulation layer reports for a bad address ("contract not
+ * found"). Reuses the same network heuristics as errorMap so the diagnostic
+ * page and the read-path errors agree.
+ */
+function classifyPreflightError(err: unknown): Exclude<PreflightKind, "ok"> {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (
+    lower.includes("network") ||
+    lower.includes("fetch failed") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("econnrefused") ||
+    lower.includes("timeout") ||
+    lower.includes("unreachable") ||
+    lower.includes("connection refused") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes(" 502") ||
+    lower.includes(" 503") ||
+    lower.includes(" 504") ||
+    lower.includes("status code 502") ||
+    lower.includes("status code 503") ||
+    lower.includes("status code 504") ||
+    lower.includes("rpc")
+  ) {
+    return "unreachable-rpc";
+  }
+  return "contract-not-found";
+}
+
+/** Cached preflight promise — the check runs once, not per navigation (#464). */
+let _preflightCache: Promise<PreflightReport> | null = null;
+
+/** Drop the cached preflight report. Test-only. */
+export function __resetPreflightForTests(): void {
+  _preflightCache = null;
+}
+
+/**
+ * Simulate one cheap read against each of the five configured contracts.
+ *
+ * A stale `.env.local` pointing at a redeployed contract fails every call
+ * with a generic simulation error; this reports the offending contract by
+ * name with the underlying error before any write path runs. The result is
+ * cached module-wide so repeated navigations share one report.
+ *
+ * Cheap reads used: registry `total_users`, bot_nft `admin`, accrual
+ * `get_accrual_admin`, marketplace `next_listing_id`, token `decimals`.
+ */
+export function preflight(sourceAddress?: string): Promise<PreflightReport> {
+  if (_preflightCache) return _preflightCache;
+
+  _preflightCache = (async (): Promise<PreflightReport> => {
+    let source: string;
+    try {
+      source = defaultSource(sourceAddress);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      const all: ContractPreflightResult[] = (
+        [
+          ["registry", REGISTRY_CONTRACT_ID],
+          ["botNft", BOT_NFT_CONTRACT_ID],
+          ["accrual", ACCRUAL_CONTRACT_ID],
+          ["marketplace", MARKETPLACE_CONTRACT_ID],
+          ["token", TOKEN_CONTRACT_ID],
+        ] as Array<[string, string]>
+      ).map(([name, contractId]) => ({
+        name,
+        contractId,
+        ok: false,
+        kind: "contract-not-found" as const,
+        error,
+      }));
+      return { ok: false, results: all };
+    }
+
+    const checks: Array<{
+      name: string;
+      contractId: string;
+      method: string;
+      args: xdr.ScVal[];
+    }> = [
+      { name: "registry", contractId: REGISTRY_CONTRACT_ID, method: "total_users", args: [] },
+      { name: "botNft", contractId: BOT_NFT_CONTRACT_ID, method: "admin", args: [] },
+      { name: "accrual", contractId: ACCRUAL_CONTRACT_ID, method: "get_accrual_admin", args: [] },
+      { name: "marketplace", contractId: MARKETPLACE_CONTRACT_ID, method: "next_listing_id", args: [] },
+      { name: "token", contractId: TOKEN_CONTRACT_ID, method: "decimals", args: [] },
+    ];
+
+    const results = await Promise.all(
+      checks.map(async (check): Promise<ContractPreflightResult> => {
+        try {
+          await simulateContractCall(check.contractId, check.method, check.args, source);
+          return { name: check.name, contractId: check.contractId, ok: true, kind: "ok" };
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          return {
+            name: check.name,
+            contractId: check.contractId,
+            ok: false,
+            kind: classifyPreflightError(err),
+            error,
+          };
+        }
+      })
+    );
+
+    return { ok: results.every((r) => r.ok), results };
+  })();
+
+  // A rejected preflight must not poison the cache — the next caller retries.
+  _preflightCache.catch(() => {
+    _preflightCache = null;
+  });
+
+  return _preflightCache;
+}

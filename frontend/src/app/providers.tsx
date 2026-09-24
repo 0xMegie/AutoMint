@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { Toaster } from "sonner";
 import { retryQuery, retryMutation } from "@/lib/retry";
+import { TxStatusList } from "@/components/ui/TxStatus";
 
 export default function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -35,6 +36,9 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       {children}
+      {/* Persistent per-transaction status rows (#461) — one row per tx id,
+          bottom-left so it never collides with the sonner toaster. */}
+      <TxStatusList />
       <Toaster
         position="bottom-right"
         richColors
