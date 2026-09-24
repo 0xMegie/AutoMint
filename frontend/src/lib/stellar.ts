@@ -10,6 +10,7 @@ import {
   isConnected as freighterIsConnected,
   requestAccess as freighterRequestAccess,
   getNetwork as freighterGetNetwork,
+  signTransaction as freighterSignTransaction,
 } from "@stellar/freighter-api";
 import {
   BASE_FEE,
@@ -331,6 +332,284 @@ export function stringToScVal(value: string): xdr.ScVal {
 
 export function boolToScVal(value: boolean): xdr.ScVal {
   return nativeToScVal(value, { type: "bool" });
+}
+
+/**
+ * Typed error thrown when the user explicitly rejects the signing request
+ * in Freighter. The UI should stay silent on this error (no error toast)
+ * — it is not a failure, just a cancellation.
+ */
+export class UserRejectedError extends Error {
+  constructor(message = "User rejected transaction") {
+    super(message);
+    this.name = "UserRejectedError";
+  }
+}
+
+/**
+ * Thrown when `sendTransaction` itself returns `ERROR` (not `PENDING`).
+ * Carries the diagnostic `errorResultXdr` for debugging.
+ */
+export class TxSendFailedError extends Error {
+  public resultXdr?: string;
+  constructor(message: string, resultXdr?: string) {
+    super(message);
+    this.name = "TxSendFailedError";
+    this.resultXdr = resultXdr;
+  }
+}
+
+/**
+ * Thrown when `getTransaction` reports `FAILED` after submission.
+ */
+export class TxFailedError extends Error {
+  public resultXdr?: string;
+  constructor(message: string, resultXdr?: string) {
+    super(message);
+    this.name = "TxFailedError";
+    this.resultXdr = resultXdr;
+  }
+}
+
+/**
+ * Thrown when the poll loop exceeds the hard timeout without reaching
+ * `SUCCESS` or `FAILED`.
+ */
+export class TxTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TxTimeoutError";
+  }
+}
+
+function isUserRejectionMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("reject") ||
+    lower.includes("cancel") ||
+    lower.includes("denied") ||
+    lower.includes("declined") ||
+    lower.includes("user declined")
+  );
+}
+
+/**
+ * Request Freighter to sign the prepared XDR.
+ *
+ * Uses the Freighter v3 `signTransaction(xdr, { networkPassphrase, address })`
+ * shape. Handles both the object return `{ signedTxXdr, error }` and the older
+ * throw-on-error contract. A user rejection (cancel/decline/deny) is mapped
+ * to {@link UserRejectedError} so the UI can suppress its error toast.
+ *
+ * @param xdr - base64 transaction XDR from `buildPreparedTx` / `buildTxXdr`
+ * @param address - optional explicit signer address; falls back to the
+ *   connected wallet's public key in the Zustand store.
+ * @returns the signed XDR string (distinct from the input)
+ */
+export async function signTx(xdr: string, address?: string): Promise<string> {
+  let resolvedAddress = address;
+  if (!resolvedAddress) {
+    try {
+      const walletKey = useWalletStore.getState().publicKey;
+      if (walletKey) resolvedAddress = walletKey;
+    } catch {
+      // Zustand store not available (e.g. in unit tests)
+    }
+  }
+
+  let result: unknown;
+  try {
+    // Freighter v3 expects (xdr, { networkPassphrase, address })
+    // Some SDK versions export signTransaction directly; handle both.
+    const signer =
+      (freighterSignTransaction as unknown as (
+        xdr: string,
+        opts: { networkPassphrase: string; address?: string }
+      ) => Promise<unknown>) ?? (null as unknown as never);
+
+    if (!signer) {
+      throw new Error("Freighter signTransaction is not available");
+    }
+
+    result = await signer(xdr, {
+      networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+      address: resolvedAddress,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isUserRejectionMessage(msg)) {
+      throw new UserRejectedError(msg);
+    }
+    // Freighter v3 may not throw but return { error }; check below.
+    // If it did throw a non-rejection error, propagate.
+    if (err instanceof UserRejectedError) throw err;
+    throw err instanceof Error ? err : new Error(msg);
+  }
+
+  // Handle Freighter v3 object return shape { signedTxXdr, error }
+  // Some builds use signedXDR / signedTransaction aliases.
+  if (typeof result === "string") {
+    if (!result) throw new Error("Freighter returned empty signed XDR");
+    return result;
+  }
+
+  if (result && typeof result === "object") {
+    const obj = result as Record<string, unknown>;
+    const errorVal = obj.error;
+    if (errorVal) {
+      const errMsg =
+        typeof errorVal === "string"
+          ? errorVal
+          : (errorVal as { message?: string })?.message ?? String(errorVal);
+      if (isUserRejectionMessage(errMsg)) {
+        throw new UserRejectedError(errMsg);
+      }
+      throw new Error(errMsg);
+    }
+
+    const signed =
+      (obj.signedTxXdr as string | undefined) ??
+      (obj.signedXDR as string | undefined) ??
+      (obj.signedTx as string | undefined) ??
+      (obj.signedTransaction as string | undefined) ??
+      (obj.signed_transaction as string | undefined) ??
+      (obj.signed as string | undefined);
+
+    if (signed) return signed;
+
+    // Fallback: some Freighter builds nest under result.signedTxXdr.error style?
+    throw new Error("Freighter did not return a signed transaction");
+  }
+
+  throw new Error("Unexpected Freighter signTransaction return shape");
+}
+
+/**
+ * Submit a signed transaction and poll until it is confirmed on-chain.
+ *
+ * 1. Rebuilds the transaction from the signed XDR via
+ *    `TransactionBuilder.fromXDR(xdr, networkPassphrase)` to validate it.
+ * 2. Sends it via `server.sendTransaction`.
+ * 3. Polls `server.getTransaction(hash)` with exponential backoff until the
+ *    status leaves `NOT_FOUND`.
+ * 4. Throws typed errors for `ERROR` (send failure), `FAILED` (on-chain
+ *    failure with `resultXdr` diagnostic), and timeout. On `SUCCESS` returns
+ *    the decoded `returnValue` (via `scValToNative`) if present.
+ *
+ * @param signedXdr - base64 signed transaction XDR from {@link signTx}
+ * @returns the contract's return value decoded with `scValToNative`, or
+ *   `undefined` when the contract returns void.
+ */
+export async function submitTx(signedXdr: string): Promise<unknown> {
+  const server = getServer();
+
+  // Rebuild to validate the XDR; fallback to raw string if the SDK's
+  // fromXDR is unavailable (test mocks) — sendTransaction will still accept it.
+  let txToSend: unknown = signedXdr;
+  try {
+    const maybeFromXdr = (TransactionBuilder as unknown as {
+      fromXDR?: (xdr: string, passphrase: string) => unknown;
+    }).fromXDR;
+    if (typeof maybeFromXdr === "function") {
+      txToSend = maybeFromXdr.call(TransactionBuilder, signedXdr, STELLAR_NETWORK_PASSPHRASE);
+    } else {
+      // Fallback via Transaction class (SDK v12 uses Transaction constructor)
+      const sdk = await import("@stellar/stellar-sdk");
+      const TxClass = (sdk as unknown as { Transaction?: unknown }).Transaction as
+        | (new (xdr: string, passphrase: string) => unknown)
+        | undefined;
+      if (TxClass) {
+        try {
+          txToSend = new (TxClass as new (x: string, p: string) => unknown)(
+            signedXdr,
+            STELLAR_NETWORK_PASSPHRASE
+          );
+        } catch {
+          txToSend = signedXdr;
+        }
+      }
+    }
+  } catch {
+    txToSend = signedXdr;
+  }
+
+  let sendRes: SorobanRpc.Api.SendTransactionResponse;
+  try {
+    // Server accepts Transaction | string depending on SDK version; cast is safe.
+    sendRes = await (server as unknown as { sendTransaction: (tx: unknown) => Promise<SorobanRpc.Api.SendTransactionResponse> }).sendTransaction(
+      txToSend as never
+    );
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+
+  // The initial send leg can synchronously report ERROR (e.g. duplicate, bad seq)
+  if ((sendRes as unknown as { status: string }).status === "ERROR") {
+    const r = sendRes as unknown as { errorResultXdr?: string; status: string };
+    throw new TxSendFailedError(
+      `Transaction submission failed: ${r.errorResultXdr ?? r.status}`,
+      r.errorResultXdr
+    );
+  }
+
+  const hash = (sendRes as unknown as { hash?: string }).hash;
+  if (!hash) {
+    throw new TxSendFailedError("No transaction hash returned from sendTransaction");
+  }
+
+  // Poll with exponential backoff and a hard timeout so we never hang forever.
+  const timeoutMs = (TX_TIMEOUT + 30) * 1000;
+  const start = Date.now();
+  let delayMs = 1000;
+  const maxDelayMs = 8000;
+
+  while (Date.now() - start < timeoutMs) {
+    let getRes: SorobanRpc.Api.GetTransactionResponse | undefined;
+    try {
+      getRes = await server.getTransaction(hash);
+    } catch {
+      // Transient RPC failure — back off and retry.
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, maxDelayMs);
+      continue;
+    }
+
+    const status = (getRes as unknown as { status: string }).status;
+
+    if (status === "NOT_FOUND") {
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, maxDelayMs);
+      continue;
+    }
+
+    if (status === "SUCCESS") {
+      const ret = (getRes as unknown as { returnValue?: xdr.ScVal }).returnValue;
+      if (ret) {
+        try {
+          return scValToNative(ret);
+        } catch {
+          return undefined;
+        }
+      }
+      return undefined;
+    }
+
+    if (status === "FAILED") {
+      const diag =
+        (getRes as unknown as { resultXdr?: string; errorResultXdr?: string }).resultXdr ??
+        (getRes as unknown as { resultXdr?: string }).resultXdr;
+      throw new TxFailedError(
+        `Transaction failed on-chain: ${diag ?? "unknown"}`,
+        diag
+      );
+    }
+
+    // Unknown status — treat as pending and back off.
+    await new Promise((r) => setTimeout(r, delayMs));
+    delayMs = Math.min(delayMs * 2, maxDelayMs);
+  }
+
+  throw new TxTimeoutError(`Transaction ${hash} not confirmed within ${timeoutMs}ms`);
 }
 
 /**
